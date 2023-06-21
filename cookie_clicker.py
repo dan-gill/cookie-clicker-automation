@@ -49,18 +49,19 @@ class CookieClicker:
         self.same_plant_setup = None
         self.two_plant_setup = None
         self.invalid_plant_id = 9999
+        self.empty_tile_plant_id = -1
+        self.cpsMult = 0
 
     def install_ublock(self):
         self.options.add_extension("./uBlock-Origin.crx")
 
     def check_achievements(self):
         try:
-            endless_cycle = self.driver.execute_script("javascript:return Game.Achievements['Endless cycle'].won;")
-            if endless_cycle:
+            if self.driver.execute_script("javascript:return Game.Achievements['Endless cycle'].won;"):
                 self.endless_cycle_achievement_won = True
                 self.attempt_endless_cycle = False
         except JavascriptException:
-            pass
+            return
 
     def freeze_check(self):
         new_title = self.driver.title
@@ -153,15 +154,15 @@ class CookieClicker:
 
     def plant_age_at_next_tick(self, x, y):
         plant_id = self.get_plant_id_of_tile(x, y)
-        if plant_id != -1:
+        if plant_id != self.empty_tile_plant_id:
             age_tick = self.plants_by_id[plant_id]["ageTick"]
             age_tick_r = self.plants_by_id[plant_id]["ageTickR"]
             tile_maturity = self.get_plant_maturity_of_tile(x, y)
             age_per_tick = age_tick + age_tick_r * 0.5
             plant_mature_age = self.plants_by_id[plant_id]['mature']
-            if tile_maturity / plant_mature_age < 1/3:
+            if tile_maturity / plant_mature_age < 1 / 3:
                 plant_maturity = "bud"
-            elif tile_maturity / plant_mature_age < 2/3:
+            elif tile_maturity / plant_mature_age < 2 / 3:
                 plant_maturity = "sprout"
             elif tile_maturity / plant_mature_age < 1:
                 plant_maturity = "bloom"
@@ -207,55 +208,80 @@ class CookieClicker:
     def is_upgrade_unlocked(self, upgrade):
         return self.driver.execute_script(f"javascript:return Game.Upgrades['{upgrade}'].unlocked;")
 
-    def get_plant_mature_age(self, x, y):
-        plant_id = self.get_plant_id_of_tile(x, y)
-        if plant_id == -1:
-            return True
-        else:
-            return int(self.driver.execute_script(f"javascript:return {self.farm_minigame}.plantsById[{plant_id}]."
-                                                  f"mature;"))
-
     def plant_seed(self, x, y, seed_id):
         tile_plant_id = self.get_plant_id_of_tile(x=x, y=y)
-        if tile_plant_id not in [-1, seed_id, self.invalid_plant_id] and (
+        if tile_plant_id not in [self.empty_tile_plant_id, seed_id, self.invalid_plant_id] and (
                 self.plants_by_id[tile_plant_id]["unlocked"] or (
                 self.get_plant_maturity_of_tile(x=x, y=y) > self.plants_by_id[tile_plant_id]["mature"]
-        )
+                )
         ):
             print(f"Removing {self.plants_by_id[tile_plant_id]}['name'] from ({x},{y}) to plant "
                   f"{self.plants_by_id[seed_id]}.")
             self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({x},{y})")
-        if tile_plant_id == -1 and (self.next_garden_tick - time.time() <= 15 or self.cpsMult < 1):
+        if tile_plant_id == self.empty_tile_plant_id and (self.next_garden_tick - time.time() <= 15 or
+                                                          self.cpsMult < 1):
             try:
                 self.cast_spell(spell_to_cast="conjure baked goods", exhaust_magic=True)
                 self.driver.execute_script(f"javascript:{self.farm_minigame}.useTool({seed_id}, {x}, {y});")
             except JavascriptException:
                 pass
 
-    def is_keenmoss_in_garden(self):
-        keenmoss_found = False
+    def get_keenmoss_tiles(self):
+        keenmoss_tiles = []
         for tile in self.farm_size:
-            if self.is_tile_unlocked(tile["x"], tile["y"]):
-                if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["keenmoss"]["id"]:
-                    keenmoss_found = True
-                    break
-        return keenmoss_found
+            if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["keenmoss"]["id"]:
+                keenmoss_tiles.append(tile)
 
-    def are_all_keenmoss_mature(self):
-        mature = True
-        for tile in self.farm_size:
-            if self.is_tile_unlocked(tile["x"], tile["y"]):
-                if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["keenmoss"]["id"]:
-                    mature = self.get_plant_maturity_of_tile(tile["x"], tile["y"]) < self.plants["keenmoss"]["mature"]
-                    break
+        return  keenmoss_tiles
 
-        return mature
+    def max_mature_keenmoss_reached(self, tiles):
+        age_tick = self.plants["keenmoss"]["ageTick"]
+        age_tick_r = self.plants["keenmoss"]["ageTickR"]
+        mature_age = self.plants["keenmoss"]["mature"]
+        min_ticks_until_mature = mature_age / (age_tick + age_tick_r * 0.5)
+        min_ticks_until_decay = 100 / (age_tick + age_tick_r * 0.5)
+
+        keenmoss_ticks_until_mature = []
+        keenmoss_age = []
+        keenmoss_details = []
+
+        for tile in tiles:
+            age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
+            ticks_until_decay = (100 - age) / (age_tick + age_tick_r * 0.5)
+            ticks_until_mature = (mature_age - age) / (age_tick + age_tick_r * 0.5)
+            ticks_until_mature = 0 if ticks_until_mature < 0 else ticks_until_mature
+            keenmoss_ticks_until_mature.append(ticks_until_mature)
+            keenmoss_age.append(age)
+            keenmoss_details.append({"ticks_until_decay": ticks_until_decay, "ticks_until_mature": ticks_until_mature})
+            min_ticks_until_decay = min(min_ticks_until_decay, ticks_until_decay)
+            min_ticks_until_mature = min(min_ticks_until_mature, ticks_until_mature)
+
+        mature_keenmoss_count = sum(ticks["ticks_until_mature"] == 0 for ticks in keenmoss_details)
+        max_mature_keenmoss_count = sum(ticks["ticks_until_mature"] - min_ticks_until_decay <= 0
+                                        for ticks in keenmoss_details
+                                        if ticks["ticks_until_decay"] >= min_ticks_until_decay)
+
+        if mature_keenmoss_count >= max_mature_keenmoss_count:
+            print(f"Mature keenmoss: {mature_keenmoss_count}; Max mature keenmoss: {max_mature_keenmoss_count}")
+            return True
+        else:
+            print(f"Mature keenmoss: {mature_keenmoss_count}; Max mature keenmoss: {max_mature_keenmoss_count}")
+            return False
+
+    def are_all_keenmoss_mature(self, tiles):
+        for tile in tiles:
+            if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["keenmoss"]["id"] and \
+                    self.get_plant_maturity_of_tile(tile["x"], tile["y"]) < self.plants["keenmoss"]["mature"]:
+                return False
+
+        return True
 
     def harvest_keenmoss_field(self):
         only_keenmoss_plants = True
         for tile in self.farm_size:
             if self.is_tile_unlocked(tile["x"], tile["y"]):
-                if self.get_plant_id_of_tile(tile["x"], tile["y"]) not in {-1, self.plants["keenmoss"]["id"]}:
+                if self.get_plant_id_of_tile(tile["x"], tile["y"]) not in {self.empty_tile_plant_id,
+                                                                           self.plants["keenmoss"]["id"]}:
                     only_keenmoss_plants = False
                     break
 
@@ -268,7 +294,7 @@ class CookieClicker:
     def is_garden_empty(self):
         garden_empty = True
         for tile in self.farm_size:
-            if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) != -1:
+            if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) != self.empty_tile_plant_id:
                 garden_empty = False
                 break
         return garden_empty
@@ -311,15 +337,18 @@ class CookieClicker:
 
     def clean_garden(self, x, y):
         plant_id_of_tile = self.get_plant_id_of_tile(x=x, y=y)
-        brown_mold_and_crumbspore_unlocked = self.plants["brownMold"]["unlocked"] and \
-                                             self.plants["crumbspore"]["unlocked"]
+        brown_mold_and_crumbspore_unlocked = (self.plants["brownMold"]["unlocked"] and
+                                              self.plants["crumbspore"]["unlocked"])
 
-        if (self.plants_by_id[plant_id_of_tile] == "meddleweed" and brown_mold_and_crumbspore_unlocked) or (
-                self.plants_by_id[plant_id_of_tile]["unlocked"] and self.plants_by_id[plant_id_of_tile] != "meddleweed"
+        if (self.plants_by_id[plant_id_of_tile]["name"] == "meddleweed" and brown_mold_and_crumbspore_unlocked) or (
+                plant_id_of_tile not in [self.invalid_plant_id,
+                                         self.plants["meddleweed"]["id"],
+                                         self.empty_tile_plant_id] and
+                self.plants_by_id[plant_id_of_tile]["unlocked"]
         ):
             ts = time.localtime()
             print(f'{ts.tm_hour:02}:{ts.tm_min:02}:{ts.tm_sec:02}: Harvesting plant '
-                  f'{self.plants_by_id[plant_id_of_tile]["name"]} in tile ({x}, {y}).')
+                  f'{self.plants_by_id[plant_id_of_tile]["name"]} ({plant_id_of_tile}) in tile ({x}, {y}).')
             self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({x},{y})")
         elif self.plants_by_id[plant_id_of_tile] != "meddleweed" or brown_mold_and_crumbspore_unlocked:
             self.harvest_mature_plants(x=x, y=y)
@@ -412,6 +441,7 @@ class CookieClicker:
             {"seed": "whiteChocoroot", "parent": ["chocoroot", "whiteMildew"]},  # 7
             {"seed": "tidygrass", "parent": ["bakerWheat", "whiteChocoroot"]},  # 80
             {"seed": "duketater", "parent": ["queenbeet"]},  # 212
+            {"seed": "shriekbulb", "parent": []},  # 18
             {"seed": "everdaisy", "parent": []},  # 250
             {"seed": "crumbspore", "parent": ["meddleweed"]},  # 15
             {"seed": "doughshroom", "parent": ["crumbspore"]},  # 43
@@ -420,7 +450,6 @@ class CookieClicker:
             {"seed": "wrinklegill", "parent": ["crumbspore", "brownMold"]},  # 26
             {"seed": "ichorpuff", "parent": ["crumbspore", "elderwort"]},  # 20
             {"seed": "chimerose", "parent": ["whiskerbloom", "shimmerlily"]},  # 18
-            {"seed": "shriekbulb", "parent": []},  # 18
             {"seed": "wardlichen", "parent": ["cronerice", "whiteMildew"]},  # 10
             {"seed": "glovemorel", "parent": ["thumbcorn", "crumbspore"]},  # 7
             {"seed": "goldenClover", "parent": ["bakerWheat", "gildmillet"]},  # 5
@@ -442,7 +471,7 @@ class CookieClicker:
                     parent_seed_maturity = self.plants[seed["parent"][0]]["mature"]
                     for tile in self.same_plant_setup:
                         tile_plant_id = self.get_plant_id_of_tile(x=tile["x"], y=tile["y"])
-                        if tile_plant_id == -1:
+                        if tile_plant_id == self.empty_tile_plant_id:
                             self.plant_seed(x=tile["x"], y=tile["y"], seed_id=parent_seed_id)
                         if tile_plant_id == self.plants[seed["seed"]]["id"]:
                             oldest_seed = max(oldest_seed, self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"]))
@@ -560,24 +589,46 @@ class CookieClicker:
                     # Harvest mature target plants
                     if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.plants[upgrade["seed"]]["id"]:
                         self.harvest_mature_plants(x=tile["x"], y=tile["y"])
+                    elif self.get_plant_id_of_tile(x=tile['x'], y=tile['y']) not in [self.plants["keenmoss"]["id"],
+                                                                                     self.invalid_plant_id,
+                                                                                     self.empty_tile_plant_id]:
+                        self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},{tile['y']})")
                     # Replant Keenmoss if tile is now empty
-                    if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == -1:
+                    if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
                         self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
 
         def strategy_4(upgrade):
-            if self.is_keenmoss_in_garden() and self.are_all_keenmoss_mature():
-                pass
             self.harvest_keenmoss_field()
-            if self.is_garden_empty():
+            keenmoss_tiles = self.get_keenmoss_tiles()
+
+            if keenmoss_tiles and self.max_mature_keenmoss_reached(keenmoss_tiles):
+                for tile in self.farm_size:
+                    plant_id = self.get_plant_id_of_tile(x=tile["x"], y=tile["y"])
+                    # Harvest mature target plants
+                    if plant_id == self.plants[upgrade["seed"]]["id"]:
+                        self.harvest_mature_plants(x=tile["x"], y =tile["y"])
+                    # Harvest plants from previous run
+                    elif plant_id not in [self.plants["keenmoss"]["id"],
+                                          self.invalid_plant_id,
+                                          self.empty_tile_plant_id]:
+                        self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},{tile['y']})")
+
+                    # Replant Keenmoss if tile is now empty
+                    if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
+                        self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
+            elif self.is_garden_empty():
                 for tile in self.farm_size:
                     self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants[upgrade["seed"]]["id"])
             else:
                 for tile in self.farm_size:
-                    # Harvest mature target plants
-                    if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.plants[upgrade["seed"]]["id"]:
+                    plant_id = self.get_plant_id_of_tile(x=tile["x"], y=tile["y"])
+                    if plant_id not in [self.empty_tile_plant_id, self.invalid_plant_id,
+                                        self.plants[upgrade["seed"]]["id"], self.plants["keenmoss"]["id"]]:
+                        self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},{tile['y']})")
+                    elif plant_id == self.plants[upgrade["seed"]]["id"] and not keenmoss_tiles:
                         self.harvest_mature_plants(x=tile["x"], y=tile["y"])
-                    # Replant Keenmoss if tile is now empty
-                    if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == -1:
+
+                    if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
                         self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
 
         def strategy_5():
@@ -623,41 +674,30 @@ class CookieClicker:
                 ichorpuff_tiles.append({"x": 3, "y": 2})
 
             for keenmoss_tile in keenmoss_tiles:
-                self.harvest_mature_plants(x=keenmoss_tile["x"], y=keenmoss_tile["y"])
-                if self.get_plant_id_of_tile(x=keenmoss_tile["x"], y=keenmoss_tile["y"]) == -1:
+                # self.harvest_mature_plants(x=keenmoss_tile["x"], y=keenmoss_tile["y"])
+                plant_id = self.get_plant_id_of_tile(x=keenmoss_tile["x"], y=keenmoss_tile["y"])
+                if plant_id not in [self.empty_tile_plant_id,
+                                    self.invalid_plant_id,
+                                    self.plants["keenmoss"]["id"]] and self.plants_by_id[plant_id]['unlocked']:
+                    self.driver.execute_script(f"javascript:{self.farm_minigame}."
+                                               f"harvest({keenmoss_tile['x']}, {keenmoss_tile['y']})")
+                plant_id = self.get_plant_id_of_tile(x=keenmoss_tile["x"], y=keenmoss_tile["y"])
+                if plant_id == self.empty_tile_plant_id:
                     self.plant_seed(x=keenmoss_tile["x"], y=keenmoss_tile["y"], seed_id=self.plants["keenmoss"]["id"])
 
             for ichorpuff_tile in ichorpuff_tiles:
                 self.harvest_mature_plants(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"])
-                if self.get_plant_id_of_tile(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"]) == -1:
+                plant_id = self.get_plant_id_of_tile(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"])
+                if plant_id not in [self.empty_tile_plant_id,
+                                    self.invalid_plant_id,
+                                    self.plants["ichorpuff"]["id"]] and self.plants_by_id[plant_id]['unlocked']:
+                    self.driver.execute_script(f"javascript:{self.farm_minigame}."
+                                               f"harvest({ichorpuff_tile['x']}, {ichorpuff_tile['y']})")
+
+                plant_id = self.get_plant_id_of_tile(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"])
+                if plant_id == self.empty_tile_plant_id:
                     self.plant_seed(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"],
                                     seed_id=self.plants["ichorpuff"]["id"])
-
-        def plant_seeds(plant, upgrade):
-            # plants = self.driver.execute_script(f'javascript: return {self.farm_minigame}.plants;')
-            # js = f'!Game.Upgrades["{upgrade}"].unlocked && {self.farm_minigame}.plants["{plant}"].unlocked'
-            # obtain_upgrade = self.driver.execute_script(f'javascript:return {js}')
-            # if obtain_upgrade:
-            if not self.is_upgrade_unlocked(upgrade) and self.plants[plant]["unlocked"]:
-                can_plant_js = f'{self.farm_minigame}.canPlant({self.farm_minigame}.plants["{plant}"]);'
-                can_plant = self.driver.execute_script(f"javascript:return {can_plant_js}")
-                if can_plant:
-                    for tile in self.farm_size:
-                        # unlocked_js = f"javascript:return {self.farm_minigame}.isTileUnlocked({x},{y});"
-                        # is_tile_unlocked = self.driver.execute_script(unlocked_js)
-                        elderwort_id = 7
-                        if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) != elderwort_id or \
-                                plant == "elderwort":
-                            self.harvest_mature_plants(x=tile["x"], y=tile["y"])
-                        # empty_js = f"javascript:return {self.farm_minigame}.getTile({x},{y})[0];"
-                        # empty = int(self.driver.execute_script(empty_js))
-                        if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == -1:
-                            try:
-                                plant_seed = f"javascript:{self.farm_minigame}." \
-                                             f"useTool({self.plants[plant]['id']}, {tile['x']}, {tile['y']});"
-                                self.driver.execute_script(plant_seed)
-                            except JavascriptException:
-                                pass
 
         upgrade_unlocked = True
         next_drop = None
@@ -675,23 +715,11 @@ class CookieClicker:
         elif next_drop["strategy"] == 3:
             strategy_3(next_drop)
         elif next_drop["strategy"] == 4:
-            pass
+            strategy_4(next_drop)
         elif next_drop["strategy"] == 5:
             if self.farm_level >= 8:
                 strategy_5()
 
-        # if not self.all_garden_drops_unlocked and (
-        #     plants_num == plants_unlocked_num or (
-        #         plants_num - 1 == plants_unlocked_num and (
-        #             self.plants["queenbeetLump"]["unlocked"] or self.is_juicy_queenbeet_growing()
-        #         )
-        #     )
-        # ):
-        #     for seed, garden_upgrade in seeds.items():
-        #         plant_seeds(seed, garden_upgrade)
-
-        # dragon_aura = int(self.driver.execute_script("javascript:return Game.dragonAura;"))
-        #     self.driver.execute_script(f"javascript:Game.SetDragonAura({wanted_aura},0);Game.ConfirmPrompt();")
         dragon_aura = int(self.driver.execute_script("javascript:return Game.dragonAura;"))
 
         wanted_aura = None
@@ -761,8 +789,8 @@ class CookieClicker:
 
     def is_juicy_queenbeet_growing(self):
         for tile in self.farm_size:
-                if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["queenbeetLump"]["id"]:
-                    return True
+            if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["queenbeetLump"]["id"]:
+                return True
         return False
 
     def try_for_shriekbulbs(self):
@@ -790,7 +818,7 @@ class CookieClicker:
         for tile in duketater_tiles:
             tile_plant_id = self.get_plant_id_of_tile(x=tile["x"], y=tile["y"])
             oldest_seed = max(oldest_seed, self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"]))
-            if tile_plant_id == -1:
+            if tile_plant_id == self.empty_tile_plant_id:
                 self.plant_seed(x=tile["x"], y=tile["y"], seed_id=parent_seed_id)
         for tile in self.farm_size:
             if tile not in duketater_tiles:
@@ -908,7 +936,7 @@ class CookieClicker:
 
         def remove_undesirable_plants(x, y):
             plant_id = self.get_plant_id_of_tile(x, y)
-            if plant_id not in {-1, self.plants["queenbeetLump"]["id"],
+            if plant_id not in {self.empty_tile_plant_id, self.plants["queenbeetLump"]["id"],
                                 self.invalid_plant_id} and not self.is_juicy_queenbeet_growing():
                 try:
                     input("An undesirable plant is present. Continuing will remove the plant.")
@@ -961,7 +989,7 @@ class CookieClicker:
 
             for tile in tiles:
                 plant_id = self.get_plant_id_of_tile(x=tile[0], y=tile[1])
-                if plant_id not in {-1, elderwort_id}:
+                if plant_id not in {self.empty_tile_plant_id, elderwort_id}:
                     print("Harvesting elderwort tiles if they don't contain elderwort.")
                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile})")
                 self.plant_seed(x=tile[0], y=tile[1], seed_id=elderwort_id)
@@ -1002,7 +1030,7 @@ class CookieClicker:
                     cost = self.driver.execute_script(cost_js)
                     total_cost = cps * 60 * total_plants * cost
                     max_maturity = 0
-                    max_plant_id = -1
+                    max_plant_id = self.empty_tile_plant_id
                     if cookies >= total_cost:
                         replant = False
                         queenbeet_id = self.plants["queenbeet"]["id"]
@@ -1029,7 +1057,7 @@ class CookieClicker:
                             else:
                                 remove_undesirable_plants(coord["x"], coord["y"])
 
-                        if max_plant_id == -1 or replant:
+                        if max_plant_id == self.empty_tile_plant_id or replant:
                             for coord in self.farm_size:
                                 if coord["y"] in y_coords:
                                     self.plant_seed(coord["x"], coord["y"], queenbeet_id)
@@ -1094,11 +1122,9 @@ class CookieClicker:
             shimmers = self.driver.execute_script("javascript:return Game.shimmers")
             if shimmers:
                 try:
-                    early_bird_won = self.driver.execute_script(
-                        "javascript:return Game.Achievements['Early bird'].won")
-                    fading_luck_won = self.driver.execute_script(
-                        "javascript:return Game.Achievements['Fading luck']."
-                        "won")
+                    early_bird_won = self.driver.execute_script("javascript:return Game.Achievements['Early bird'].won")
+                    fading_luck_won = self.driver.execute_script("javascript:return "
+                                                                 "Game.Achievements['Fading luck'].won")
                     fps = self.driver.execute_script("javascript:return Game.fps")
                     # print(f"Fading Luck Won: {fading_luck_won}\nEarly Bird Won: {early_bird_won}\nFPS: {fps}")
                     # print(type(shimmers))
@@ -1272,7 +1298,7 @@ class CookieClicker:
                     break
                 else:
                     self.wait_to_buy_upgrade = False
-            except NoSuchElementException:
+            except (NoSuchElementException, StaleElementReferenceException):
                 self.wait_to_buy_upgrade = False
                 self.click_cookie()
 
@@ -1310,37 +1336,59 @@ class CookieClicker:
 
     def stock_market(self):
         market = "Game.Objects['Bank'].minigame"
-        try:
-            brokers = self.driver.execute_script(f"javascript:return {market}.brokers;")
-            max_brokers = self.driver.execute_script(f"javascript:return {market}.getMaxBrokers();")
-            if brokers < max_brokers:
-                broker_price = self.driver.execute_script(f"javascript:return {market}.getBrokerPrice();") * 100
-                cookies = self.driver.execute_script(f"javascript:return Game.cookies;")
-                if broker_price < cookies:
-                    self.driver.find_element(by=By.ID, value="bankBrokersBuy").click()
-        except (JavascriptException, NoSuchElementException, ElementClickInterceptedException):
-            self.click_cookie()
+        market_achievements = [
+            'Initial public offering',
+            'Rookie numbers',
+            'No nobility in poverty',
+            'Full warehouses',
+            'Make my day',
+            'Buy buy buy',
+            'Pyramid scheme',
+            'Liquid assets',
+            'Debt evasion',
+            'Gaseous assets'
+        ]
+        all_market_achievements_unlocked = True
+        for market_achievement in market_achievements:
+            if not self.driver.execute_script(f"javascript:return Game.Achievements['{market_achievement}'].won"):
+                all_market_achievements_unlocked = False
+                break
 
-        try:
-            bank_level = int(self.driver.find_element(by=By.ID, value="productLevel5").text.split()[1])
-            number_of_goods = len(self.driver.find_elements(by=By.XPATH, value='//div[@class="bankGood"]'))
-            for i in range(number_of_goods - 1):
-                try:
-                    stock_price = float(self.driver.find_element(by=By.ID, value=f"bankGood-{i}-val").text.replace("$",
-                                                                                                                   ""))
-                    stock_shares = int(self.driver.find_element(by=By.ID, value=f"bankGood-{i}-stock").text)
-                    stock_max = int(self.driver.find_element(by=By.ID, value=f"bankGood-{i}-stockMax").text.replace("/",
-                                                                                                                    ""))
-                    if stock_price <= (10 * (i + 1) + bank_level - 1) / 5 and stock_shares != stock_max:
-                        self.driver.find_element(by=By.ID, value=f"bankGood-{i}_Max").click()
-                    elif stock_shares > 0 and stock_price >= (10 * (i + 1) + bank_level - 1):
-                        self.driver.find_element(by=By.ID, value=f"bankGood-{i}_-All").click()
-                    else:
+        if not all_market_achievements_unlocked:
+            wait_to_sell = True
+            try:
+                brokers = self.driver.execute_script(f"javascript:return {market}.brokers;")
+                max_brokers = self.driver.execute_script(f"javascript:return {market}.getMaxBrokers();")
+                if brokers < max_brokers:
+                    broker_price = self.driver.execute_script(f"javascript:return {market}.getBrokerPrice();") * 100
+                    cookies = self.driver.execute_script(f"javascript:return Game.cookies;")
+                    if broker_price < cookies:
+                        self.driver.find_element(by=By.ID, value="bankBrokersBuy").click()
+            except (JavascriptException, NoSuchElementException, ElementClickInterceptedException):
+                self.click_cookie()
+
+            try:
+                bank_level = int(self.driver.find_element(by=By.ID, value="productLevel5").text.split()[1])
+                number_of_goods = len(self.driver.find_elements(by=By.XPATH, value='//div[@class="bankGood"]'))
+                for i in range(number_of_goods - 1):
+                    try:
+                        stock_price = float(self.driver.find_element(by=By.ID,
+                                                                     value=f"bankGood-{i}-val").text.replace("$", ""))
+                        stock_shares = int(self.driver.find_element(by=By.ID,
+                                                                    value=f"bankGood-{i}-stock").text.replace(",", ""))
+                        stock_max = int(self.driver.find_element(by=By.ID,
+                                                                 value=f"bankGood-{i}-stockMax").text.replace("/", "").
+                                        replace(",", ""))
+                        if stock_price <= (10 * (i + 1) + bank_level - 1) / 5 and stock_shares != stock_max:
+                            self.driver.find_element(by=By.ID, value=f"bankGood-{i}_Max").click()
+                        elif stock_shares > 0 and stock_price >= (10 * (i + 1) + bank_level - 1):
+                            self.driver.find_element(by=By.ID, value=f"bankGood-{i}_-All").click()
+                        else:
+                            self.click_cookie()
+                    except (ElementClickInterceptedException, NoSuchElementException):
                         self.click_cookie()
-                except (ElementClickInterceptedException, NoSuchElementException):
-                    self.click_cookie()
-        except NoSuchElementException:
-            self.click_cookie()
+            except NoSuchElementException:
+                self.click_cookie()
 
     def upgrade_santa(self):
         try:
