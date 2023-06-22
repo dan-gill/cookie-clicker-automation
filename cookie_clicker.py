@@ -1,3 +1,5 @@
+import math
+
 from selenium import webdriver
 from selenium.common import NoSuchElementException, WebDriverException, ElementClickInterceptedException, \
     JavascriptException, StaleElementReferenceException, ElementNotInteractableException
@@ -170,10 +172,12 @@ class CookieClicker:
                 plant_maturity = "mature"
             ticks_until_mature = (plant_mature_age - tile_maturity) / age_per_tick
             ticks_until_mature = 0 if ticks_until_mature < 0 else ticks_until_mature
-            print(f"{x, y} {self.plants_by_id[plant_id]['name']} stage: {plant_maturity}; "
-                  f"Age at next tick: {tile_maturity + age_per_tick}; Mature at {plant_mature_age}; "
-                  f"{ticks_until_mature} ticks until mature.")
-            return age_per_tick + tile_maturity
+            age_at_next_tick = age_per_tick + tile_maturity
+            if age_at_next_tick >= 100 or math.floor(ticks_until_mature) == 1:
+                print(f"{x, y} {self.plants_by_id[plant_id]['name']} stage: {plant_maturity}; "
+                      f"Age at next tick: {tile_maturity + age_per_tick}; Mature at {plant_mature_age}; "
+                      f"{ticks_until_mature} ticks until mature.")
+            return age_at_next_tick
         else:
             return 0
 
@@ -267,14 +271,6 @@ class CookieClicker:
         else:
             print(f"Mature keenmoss: {mature_keenmoss_count}; Max mature keenmoss: {max_mature_keenmoss_count}")
             return False
-
-    def are_all_keenmoss_mature(self, tiles):
-        for tile in tiles:
-            if self.get_plant_id_of_tile(tile["x"], tile["y"]) == self.plants["keenmoss"]["id"] and \
-                    self.get_plant_maturity_of_tile(tile["x"], tile["y"]) < self.plants["keenmoss"]["mature"]:
-                return False
-
-        return True
 
     def harvest_keenmoss_field(self):
         only_keenmoss_plants = True
@@ -600,6 +596,10 @@ class CookieClicker:
         def strategy_4(upgrade):
             self.harvest_keenmoss_field()
             keenmoss_tiles = self.get_keenmoss_tiles()
+            empty_tiles = []
+            keenmoss_ticks_to_mature = self.plants["keenmoss"]["mature"] / (self.plants["keenmoss"]["ageTick"] +
+                                                                            self.plants["keenmoss"]["ageTickR"] * 0.5)
+            sg_oldest_age_at_next_tick = 0
 
             if keenmoss_tiles and self.max_mature_keenmoss_reached(keenmoss_tiles):
                 for tile in self.farm_size:
@@ -607,6 +607,8 @@ class CookieClicker:
                     # Harvest mature target plants
                     if plant_id == self.plants[upgrade["seed"]]["id"]:
                         self.harvest_mature_plants(x=tile["x"], y =tile["y"])
+                        sg_oldest_age_at_next_tick = max(sg_oldest_age_at_next_tick,
+                                                         self.plant_age_at_next_tick(x=tile["x"], y=tile["y"]))
                     # Harvest plants from previous run
                     elif plant_id not in [self.plants["keenmoss"]["id"],
                                           self.invalid_plant_id,
@@ -615,6 +617,18 @@ class CookieClicker:
 
                     # Replant Keenmoss if tile is now empty
                     if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
+                        empty_tiles.append(tile)
+
+                if sg_oldest_age_at_next_tick > self.plants[upgrade["seed"]]["mature"]:
+                    slower_plant_ticks_until_mature = 0
+                else:
+                    slower_plant_ticks_until_mature = (self.plants[upgrade["seed"]]["mature"] -
+                                                       sg_oldest_age_at_next_tick) / (
+                                                              self.plants[upgrade["seed"]]["ageTick"] +
+                                                              self.plants[upgrade["seed"]]["ageTickR"] * 0.5)
+
+                if slower_plant_ticks_until_mature <= keenmoss_ticks_to_mature:
+                    for tile in empty_tiles:
                         self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
             elif self.is_garden_empty():
                 for tile in self.farm_size:
@@ -625,10 +639,25 @@ class CookieClicker:
                     if plant_id not in [self.empty_tile_plant_id, self.invalid_plant_id,
                                         self.plants[upgrade["seed"]]["id"], self.plants["keenmoss"]["id"]]:
                         self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},{tile['y']})")
-                    elif plant_id == self.plants[upgrade["seed"]]["id"] and not keenmoss_tiles:
-                        self.harvest_mature_plants(x=tile["x"], y=tile["y"])
+                    elif plant_id == self.plants[upgrade["seed"]]["id"]:
+                        if not keenmoss_tiles:
+                            self.harvest_mature_plants(x=tile["x"], y=tile["y"])
+                        sg_oldest_age_at_next_tick = max(sg_oldest_age_at_next_tick,
+                                                         self.plant_age_at_next_tick(x=tile["x"], y=tile["y"]))
 
                     if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
+                        empty_tiles.append(tile)
+
+                if sg_oldest_age_at_next_tick > self.plants[upgrade["seed"]]["mature"]:
+                    slower_plant_ticks_until_mature = 0
+                else:
+                    slower_plant_ticks_until_mature = (self.plants[upgrade["seed"]]["mature"] -
+                                                       sg_oldest_age_at_next_tick) / (
+                                                              self.plants[upgrade["seed"]]["ageTick"] +
+                                                              self.plants[upgrade["seed"]]["ageTickR"] * 0.5)
+
+                if slower_plant_ticks_until_mature <= keenmoss_ticks_to_mature:
+                    for tile in empty_tiles:
                         self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
 
         def strategy_5():
