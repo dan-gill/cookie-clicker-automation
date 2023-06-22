@@ -72,9 +72,6 @@ while is_game_on and not save_and_exit:
     if not prompt_for_save:
         cookie_clicker.click_cookie()
 
-        # Check for buffs
-        cookie_clicker.check_for_buffs()
-
         # Buy upgrades and products
         cookie_clicker.buy_upgrades()
         cookie_clicker.check_for_upgrades()
@@ -89,12 +86,10 @@ while is_game_on and not save_and_exit:
             cookie_clicker.save_game()
 
         if time.gmtime().tm_sec < 5:
-            # if not cookie_clicker.skip_pause:
-            #     time.sleep(5)
             # Close notes
             cookie_clicker.close_notes()
 
-        if time.time() >= end_time and not cookie_clicker.skip_pause:
+        if time.time() >= end_time:
             is_game_on = False
 
     else:
