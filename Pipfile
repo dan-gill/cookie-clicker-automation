@@ -4,8 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-selenium = "~=4.17.2"
-keyboard = "*"
+selenium = "*"
+numpy = "*"
+python-dotenv = "*"
+colorama = "*"
+scipy = "*"
+humanize = "*"
 
 [dev-packages]
 
