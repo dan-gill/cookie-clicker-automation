@@ -13,9 +13,9 @@ PROGRESS_FILE = getenv("PROGRESS_FILE")
 is_game_on = True
 save_and_exit = False
 NUMBER_OF_HOURS_TO_RUN = 168
-HOURS_BETWEEN_WRINKLER_POPS = 2
+HOURS_BETWEEN_WRINKLER_POPS = 24
 # HOURS_BETWEEN_RELOADS = 4  # This helps with the lag issue due to memory usage on Chrome
-MIN_AVAILABLE_MEMORY_GB = 2.5
+MIN_AVAILABLE_MEMORY_GB = 2.375
 
 building_level_goal = "cps"
 handle_ascension = False
@@ -25,6 +25,7 @@ cookie_clicker = CookieClicker(save_file=PROGRESS_FILE, building_level_goal=buil
 
 # Load game
 cookie_clicker.load_cookieclicker()
+# input("pause")
 
 end_time = time.time() + (3600 * NUMBER_OF_HOURS_TO_RUN)
 structured_end_time = time.localtime(end_time)
@@ -38,11 +39,6 @@ else:
     prompt_for_save = False
 # prompt_for_save = ynbox(msg="Do you want a manual run this round?", title="Manual run")
 
-counter = 0
-# memory_leak_reset_time = time.time() + (3600 * HOURS_BETWEEN_RELOADS)
-cookie_clicker.set_buildings_owned()
-cookie_clicker.level_up()
-cookie_clicker.get_plant_details(ignore_tick=True)
 while is_game_on and not save_and_exit:
     memory_available = psutil.virtual_memory().available / 1024 / 1024 / 1024
     if memory_available < MIN_AVAILABLE_MEMORY_GB:
@@ -53,7 +49,11 @@ while is_game_on and not save_and_exit:
         cookie_clicker.delay_product_purchase_until_after = time.time() + 30
     cookie_clicker.check_veil()
     cookie_clicker.level_up()
-    if time.time() >= cookie_clicker.time_last_wrinkler_popped + (HOURS_BETWEEN_WRINKLER_POPS * 3600):
+    if cookie_clicker.season_active == 'halloween':
+        pop_every = 0.5
+    else:
+        pop_every = HOURS_BETWEEN_WRINKLER_POPS
+    if time.time() >= cookie_clicker.time_last_wrinkler_popped + (pop_every * 3600):
         cookie_clicker.pop_fattest_wrinkler()
     cookie_clicker.open_mini_games()
     cookie_clicker.harvest_lumps()
@@ -78,9 +78,6 @@ while is_game_on and not save_and_exit:
         cookie_clicker.buy_products()
         cookie_clicker.buy_upgrades()
 
-        # Click fortune
-        cookie_clicker.click_fortune()
-
         cookie_clicker.stock_market()
 
         if time.time() >= cookie_clicker.time_next_save:
@@ -100,7 +97,6 @@ while is_game_on and not save_and_exit:
         else:
             save_and_exit = False
 
-    counter += 1
     cookie_clicker.set_cps_multiplier()
     if cookie_clicker.cpsMult > cookie_clicker.cps_threshold or cookie_clicker.cpsMult <= 1:
         if cookie_clicker.farming_goal == 'lumps':

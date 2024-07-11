@@ -13,9 +13,12 @@ from colorama import init as colorama_init
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.common import NoSuchElementException, WebDriverException, ElementClickInterceptedException, \
-    JavascriptException, ElementNotInteractableException, InvalidSessionIdException
+    JavascriptException, ElementNotInteractableException, InvalidSessionIdException, StaleElementReferenceException, \
+    TimeoutException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 load_dotenv()
 colorama_init()
@@ -68,7 +71,7 @@ class CookieClicker:
         self.ascensions = 0
         self.dragon_level = 0
         self.max_dragon_level = 0
-        self.endless_cycle_achievement_won = False
+        self.endless_cycle_achievement_won = self.crafty_pixies = False
         self.dragon_complete = False
         self.title = None
         self.farm_level = 0
@@ -160,17 +163,14 @@ class CookieClicker:
         ])
         self.cursor_upgrades = [0, 1, 2, 3, 4, 5, 6, 43, 82, 109, 188, 189, 660, 764, 873]
         self.clicking_upgrades = [75, 76, 77, 78, 119, 190, 191, 366, 367, 427, 460, 461, 661, 765, 874]
-        self.cost_scaling_upgrades = [648, 649, 650, 651, 474, 475]
+        self.cost_scaling_upgrades = [648, 649, 650, 651, 473, 474, 475]
 
     def install_ublock(self):
         self.options.add_extension("./uBlock-Origin.crx")
 
     def check_achievements(self, achievement):
         try:
-            if self.driver.execute_script(f"javascript:return Game.Achievements['{achievement}'].won;"):
-                return True
-            else:
-                return False
+            return self.driver.execute_script(f"javascript:return Game.Achievements['{achievement}'].won;") == 1
         except JavascriptException:
             return False
 
@@ -185,7 +185,6 @@ class CookieClicker:
         if not skip_save:
             self.save_game(path=self.save_file)
         self.driver.quit()
-        time.sleep(5)
         self.load_cookieclicker()
 
     def load_cookieclicker(self):
@@ -193,55 +192,89 @@ class CookieClicker:
 
         # Load game webpage
         self.driver.get("https://orteil.dashnet.org/cookieclicker/")
-        # input("Pausing for Cloudfare")
-        time.sleep(1)
-        # input("Waiting for page to load")
+        # input("Pause")
 
-        # Click to accept cookie notification
-        self.accept_cookie_notification()
-
-        # If language isn't selected, select it.
+        # Select language if not already selected
         self.select_language()
-        time.sleep(0.5)
 
         # Close save progress notification
         self.close_notes()
 
-        # Load save game
-        time.sleep(1)
+        try:
+            # Wait for CookieMonster to load by checking for its presence
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.execute_script("return typeof Game.ImportSaveCode == 'function';")
+            )
+        except TimeoutException:
+            self.reload_cookieclicker(skip_save=True)
+
         self.load_save()
 
-        # self.time_last_wrinkler_popped = time.time()
-
+        # Load mods
         self.load_mods()
 
+        # Click to accept cookie notification
+        self.accept_cookie_notification()
+
+        if self.attempt_1T_achievement:
+            self.attempt_1T_achievement = self.check_achievements("When the cookies ascend just right") == 0
+
+        if self.buildings_owned is None:
+            self.set_buildings_owned()
+            self.level_up()
+
+        if self.plants is None:
+            self.get_plant_details(ignore_tick=True)
+
     def load_mods(self):
-        self.driver.execute_script("javascript:(function() {"
-                                   "Game.LoadMod('https://klattmose.github.io/CookieClicker/FortuneCookie.js'); }());")
-        time.sleep(1)
-        self.driver.execute_script(
-            "javascript:(function() {"
-            "Game.LoadMod('https://cookiemonsterteam.github.io/CookieMonster/dist/CookieMonster.js');}());")
+        mods_to_load = {
+            "FortuneCookie": "https://klattmose.github.io/CookieClicker/FortuneCookie.js",
+            "CookieMonsterData": "https://cookiemonsterteam.github.io/CookieMonster/dist/CookieMonster.js"
+        }
+
+        try:
+            # Wait for Game.LoadMod to load by checking for its presence
+            WebDriverWait(self.driver, 2).until(
+                lambda d: d.execute_script("return typeof Game.LoadMod == 'function';")
+            )
+        except TimeoutException:
+            self.reload_cookieclicker(skip_save=True)
+
+        for mod, mod_url in mods_to_load.items():
+            try:
+                if self.driver.execute_script(f"javascript:return typeof {mod} == 'undefined';"):
+                    exec_js = f"javascript:Game.LoadMod('{mod_url}');"
+                    # Load FortuneCookie mod
+                    print(f"{timestamp()}: Load module script: {mod_url}")
+                    self.driver.execute_script(exec_js)
+
+                    # Wait for modules to load by checking for their presence
+                    WebDriverWait(self.driver, 1).until(
+                        lambda d: d.execute_script(f"return typeof {mod} == 'object';")
+                    )
+            except TimeoutException:
+                self.load_mods()
+            except JavascriptException:
+                self.reload_cookieclicker()
 
     def accept_cookie_notification(self):
         try:
-            self.driver.find_element(by=By.XPATH, value='//a[@class="cc_btn cc_btn_accept_all"]').click()
-        except (NoSuchElementException, ElementNotInteractableException):
-            return
+            self.driver.execute_script("javascript:document.querySelector('a.cc_btn.cc_btn_accept_all').click();")
+        except JavascriptException:
+            print(f"{timestamp()}: Failed to accept browser cookie.")
 
     def select_language(self):
         try:
+            # Wait for language selection to load by checking for its presence
+            WebDriverWait(self.driver, 10).until(
+                EC.visibility_of_element_located((By.ID, "langSelect-EN"))
+            )
             self.driver.execute_script("localStorageSet('CookieClickerLang','EN'); Game.toSave=true;"
                                        "Game.toReload=true;")
         except JavascriptException:
             return
-
-    def click_fortune(self):
-        try:
-            self.driver.execute_script("javascript:if (Game.TickerEffect) {Game.tickerL.click()}")
-        except JavascriptException:
-            print(f"{timestamp()}: {Fore.RED}Failed to click fortune.{Style.RESET_ALL}")
-            self.click_cookie()
+        except TimeoutException:
+            self.reload_cookieclicker(skip_save=True)
 
     def close_notes(self):
         try:
@@ -349,75 +382,6 @@ class CookieClicker:
                   f"{ticks_until_mature} ticks until mature.")
         return age_at_next_tick
 
-    # def harvest_plants(self):
-    #     self.get_plant_details()
-    #
-    #     try:
-    #         if not self.driver.execute_script('javascript:return Game.isMinigameReady(Game.Objects["Farm"])'):
-    #             return
-    #     except JavascriptException:
-    #         self.click_cookie()
-    #         return
-    #
-    #     if self.cpsMult <= 1 and self.next_garden_tick - time.time() > SECONDS_UNTIL_NEXT_TICK:
-    #         return
-    #
-    #     if self.last_harvest_check <= self.previous_garden_tick:
-    #         for tile, seed in self.occupied_tiles.items():
-    #             self.click_cookie()
-    #             self.last_harvest_check = time.time()
-    #             plant_name = seed['name']
-    #             plant_age = seed['maturity']
-    #             plant_mature_age = self.plants[plant_name]["mature"]
-    #             plant_unlocked = self.plants[plant_name]["unlocked"]
-    #             plant_age_at_next_tick = seed['age_at_next_tick']
-    #
-    #             # Harvest decaying plants
-    #             if plant_age_at_next_tick >= 100:
-    #                 print(f'{timestamp()}: Harvesting {plant_name} from {tile} before decay.')
-    #                 try:
-    #                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile})")
-    #                     del self.occupied_tiles[tile]
-    #                     if self.cpsMult > 1:
-    #                         self.last_buffed_harvest = time.time()
-    #                 except JavascriptException:
-    #                     self.click_cookie()
-    #             # Harvest mature plants to unlock seeds
-    #             elif not plant_unlocked and plant_name != "meddleweed" and plant_age >= plant_mature_age:
-    #                 print(f'{timestamp()}: Harvesting all mature {plant_name} from ({tile}) to unlock new seed.')
-    #                 try:
-    #                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile})")
-    #                     del self.occupied_tiles[tile]
-    #                     if self.cpsMult > 1:
-    #                         self.last_buffed_harvest = time.time()
-    #                 except JavascriptException:
-    #                     self.click_cookie()
-    #             # Harvest meddleweed if Brown Mold and Crumbspore unlocked
-    #             elif plant_name == "meddleweed" and self.is_seed_unlocked_or_growing("brownMold") and \
-    #                     self.is_seed_unlocked_or_growing("crumbspore"):
-    #                 print(f'{timestamp()}: Harvesting all meddleweed.')
-    #                 try:
-    #                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile})")
-    #                     del self.occupied_tiles[tile]
-    #                     if self.cpsMult > 1:
-    #                         self.last_buffed_harvest = time.time()
-    #                 except JavascriptException:
-    #                     self.click_cookie()
-
-    # def harvest_fading_plants(self):
-    #     if self.cpsMult > 1 or self.next_garden_tick - time.time() <= SECONDS_UNTIL_NEXT_TICK:
-    #         for tile, seed in self.occupied_tiles.items():
-    #             self.click_cookie()
-    #             if seed['age_at_next_tick'] >= 100:
-    #                 print(f'{timestamp()}: Harvesting tile {tile} before decay.')
-    #                 try:
-    #                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile})")
-    #                     del self.occupied_tiles[tile]
-    #                     if self.cpsMult > 1:
-    #                         self.last_buffed_harvest = time.time()
-    #                 except JavascriptException:
-    #                     self.click_cookie()
-
     def harvest_mature_plants(self, x, y):
         try:
             plant_data = self.occupied_tiles[x, y]
@@ -440,24 +404,28 @@ class CookieClicker:
 
     def get_plot_details(self):
         try:
-            self.plot = self.driver.execute_script(f'javascript:return {self.farm_minigame}.plot')
-            self.plot_boost = self.driver.execute_script(f'javascript:return {self.farm_minigame}.plotBoost')
+            self.plot, self.plot_boost = self.driver.execute_script(f'javascript:return [{self.farm_minigame}.plot, '
+                                                                    f'{self.farm_minigame}.plotBoost]')
+            # self.plot_boost = self.driver.execute_script(f'javascript:return {self.farm_minigame}.plotBoost')
         except JavascriptException:
             self.quit_game()
 
     def get_plant_details(self, ignore_tick=False):
         self.get_next_garden_tick_in_seconds()
+        current_time = time.time()
 
+        # Fetch next soil time if it hasn't been set
         if self.next_soil_time == 0:
-            next_soil_time_js = f"javascript:return {self.farm_minigame}.nextSoil;"
             self.set_cps_multiplier()
             try:
-                self.next_soil_time = self.driver.execute_script(next_soil_time_js) / 1000
+                self.next_soil_time = self.driver.execute_script(
+                    f"javascript:return {self.farm_minigame}.nextSoil / 1000")
             except JavascriptException:
-                self.next_soil_time = time.time() + 1000
+                self.next_soil_time = current_time + 1000
 
-        if not ignore_tick and (self.previous_garden_tick < self.last_garden_check_time < self.next_garden_tick
-                                or time.time() - 2 <= self.next_soil_time <= time.time() + 2):
+        # Early return if within the tick boundaries
+        if not ignore_tick and (self.previous_garden_tick < self.last_garden_check_time < self.next_garden_tick or
+                                current_time - 2 <= self.next_soil_time <= current_time + 2):
             return
 
         if self.previous_garden_tick < self.last_garden_check_time < self.next_garden_tick:
@@ -465,26 +433,34 @@ class CookieClicker:
             self.harvested_this_tick = False
 
         self.attempt_to_unlock_seeds = True
+        self.last_garden_check_time = current_time
 
-        self.last_garden_check_time = time.time()
-        seconds_until_next_tick = self.next_garden_tick - time.time()
+        # Print next tick details
+        seconds_until_next_tick = self.next_garden_tick - current_time
         time_of_next_tick_struct = time.localtime(self.next_garden_tick)
         time_of_next_tick = (f'{time_of_next_tick_struct.tm_hour:02}:{time_of_next_tick_struct.tm_min:02}:'
                              f'{time_of_next_tick_struct.tm_sec:02}')
         print(f'{timestamp()}: Updating plant details in self.plants and self.plants_by_id. '
               f'Next garden tick in {seconds_until_next_tick:.0f} seconds at {time_of_next_tick}.')
+
         try:
-            self.plants = self.driver.execute_script(f"javascript:return {self.farm_minigame}.plants")
+            self.plants, self.plants_by_id, self.max_plants = self.driver.execute_script(
+                f"javascript:return [{self.farm_minigame}.plants, {self.farm_minigame}.plantsById, "
+                f"{self.farm_minigame}.plantsN]")
+            # self.plants_by_id = self.driver.execute_script(f"javascript:return {self.farm_minigame}.plantsById")
+            # self.max_plants = self.driver.execute_script(f"javascript:return {self.farm_minigame}.plantsN")
+
+            # Reset plant states
             for key in self.plants:
                 self.click_cookie()
                 self.plants[key]['growing'] = False
                 self.plants[key]["ticks_until_mature"] = float('inf')
                 self.plants[key]["ticks_until_decayed"] = float('inf')
-            self.plants_by_id = self.driver.execute_script(f"javascript:return {self.farm_minigame}.plantsById")
-            self.max_plants = self.driver.execute_script(f"javascript:return {self.farm_minigame}.plantsN")
+
             self.set_farm_size()
             self.occupied_tiles = {}
             self.get_plot_details()
+
             try:
                 aura_multi = self.driver.execute_script("javascript:return Game.auraMult('Supreme Intellect')")
                 dragon_boost = 1 / (1 + 0.05 * aura_multi)
@@ -499,21 +475,21 @@ class CookieClicker:
 
                 plant = self.plants_by_id[tile_id]['key']
                 age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
-                max_age_per_tick = (self.plants[plant]["ageTick"] +
-                                    self.plants[plant]["ageTickR"]) * (self.plot_boost[tile["y"]][tile["x"]][0] *
-                                                                       dragon_boost)
-                avg_age_per_tick = (self.plants[plant]["ageTick"] +
-                                    self.plants[plant]["ageTickR"] / 2) * (self.plot_boost[tile["y"]][tile["x"]][0] *
-                                                                           dragon_boost)
+                plot_boost_value = self.plot_boost[tile["y"]][tile["x"]][0] * dragon_boost
+                max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant]["ageTickR"]) * plot_boost_value
+                avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
+                    "ageTickR"] / 2) * plot_boost_value
                 age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick
+
+                ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
+                ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
+
                 if not self.plants[plant]["unlocked"]:
-                    if (plant != 'meddleweed' and age >= self.plants[plant]["mature"]) or (plant == 'meddleweed' and
-                                                                                           age_at_next_tick >= 100):
+                    if (plant != 'meddleweed' and age >= self.plants[plant]["mature"]) or (
+                            plant == 'meddleweed' and age_at_next_tick >= 100):
                         print(f'{timestamp()}: Harvesting tile {tile} to unlock seed. {plant} is mature.')
                         self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},{tile['y']})")
                         self.get_plot_details()
-                        # if self.cpsMult > 1:
-                        #     self.last_buffed_harvest = time.time()
                         self.plants[plant]["unlocked"] = True
                         self.plants[plant]["ticks_until_mature"] = float('inf')
                         self.plants[plant]["growing"] = False
@@ -524,14 +500,11 @@ class CookieClicker:
                                 continue
                             plant = self.plants_by_id[tile_id]['key']
                             age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
-                            max_age_per_tick = (self.plants[plant]["ageTick"] +
-                                                self.plants[plant]["ageTickR"]) * (
-                                                       self.plot_boost[tile["y"]][tile["x"]][0] * dragon_boost)
-                            avg_age_per_tick = (self.plants[plant]["ageTick"] +
-                                                self.plants[plant]["ageTickR"] / 2) * (
-                                                       self.plot_boost[tile["y"]][tile["x"]][0] * dragon_boost)
-                            age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 \
-                                else age + avg_age_per_tick
+                            max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
+                                "ageTickR"]) * plot_boost_value
+                            avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
+                                "ageTickR"] / 2) * plot_boost_value
+                            age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick
                             ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
                             ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
                             self.plants[plant]["ticks_until_mature"] = min(self.plants[plant]["ticks_until_mature"],
@@ -539,44 +512,45 @@ class CookieClicker:
                             self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
                                                                             ticks_until_decayed)
                             self.plants[plant]["growing"] = True
-                            self.occupied_tiles[tile["x"], tile["y"]] = {"name": plant,
-                                                                         "id": tile_id,
-                                                                         "ticks_until_mature": ticks_until_mature,
-                                                                         "ticks_until_decayed": ticks_until_decayed,
-                                                                         "maturity": age,
-                                                                         "age_at_next_tick": age_at_next_tick}
+                            self.occupied_tiles[tile["x"], tile["y"]] = {
+                                "name": plant,
+                                "id": tile_id,
+                                "ticks_until_mature": ticks_until_mature,
+                                "ticks_until_decayed": ticks_until_decayed,
+                                "maturity": age,
+                                "age_at_next_tick": age_at_next_tick
+                            }
                     else:
-                        ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
-                        ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
                         self.plants[plant]["ticks_until_mature"] = min(self.plants[plant]["ticks_until_mature"],
                                                                        ticks_until_mature)
                         self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
                                                                         ticks_until_decayed)
                         self.plants[plant]["growing"] = True
-                        self.occupied_tiles[tile["x"], tile["y"]] = {"name": plant,
-                                                                     "id": tile_id,
-                                                                     "ticks_until_mature": ticks_until_mature,
-                                                                     "ticks_until_decayed": ticks_until_decayed,
-                                                                     "maturity": age,
-                                                                     "age_at_next_tick": age_at_next_tick}
+                        self.occupied_tiles[tile["x"], tile["y"]] = {
+                            "name": plant,
+                            "id": tile_id,
+                            "ticks_until_mature": ticks_until_mature,
+                            "ticks_until_decayed": ticks_until_decayed,
+                            "maturity": age,
+                            "age_at_next_tick": age_at_next_tick
+                        }
                 elif age_at_next_tick >= 100:
                     print(f'{timestamp()}: Harvesting {plant} at tile {tile} before decay.')
                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},{tile['y']})")
                     self.get_plot_details()
                     if self.cpsMult > 1:
-                        self.last_buffed_harvest = time.time()
+                        self.last_buffed_harvest = current_time
                     if plant == 'meddleweed':
                         tile_id = self.get_plant_id_of_tile(tile["x"], tile["y"])
                         if tile_id in [self.empty_tile_plant_id, self.invalid_plant_id]:
                             continue
                         plant = self.plants_by_id[tile_id]['key']
                         age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
-                        max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant]["ageTickR"]) * (
-                                self.plot_boost[tile["y"]][tile["x"]][0] * dragon_boost)
-                        avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant]["ageTickR"] / 2) * (
-                                self.plot_boost[tile["y"]][tile["x"]][0] * dragon_boost)
-                        age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 \
-                            else age + avg_age_per_tick
+                        max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
+                            "ageTickR"]) * plot_boost_value
+                        avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
+                            "ageTickR"] / 2) * plot_boost_value
+                        age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick
                         ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
                         ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
                         self.plants[plant]["ticks_until_mature"] = min(self.plants[plant]["ticks_until_mature"],
@@ -584,26 +558,29 @@ class CookieClicker:
                         self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
                                                                         ticks_until_decayed)
                         self.plants[plant]["growing"] = True
-                        self.occupied_tiles[tile["x"], tile["y"]] = {"name": plant,
-                                                                     "id": tile_id,
-                                                                     "ticks_until_mature": ticks_until_mature,
-                                                                     "ticks_until_decayed": ticks_until_decayed,
-                                                                     "maturity": age,
-                                                                     "age_at_next_tick": age_at_next_tick}
+                        self.occupied_tiles[tile["x"], tile["y"]] = {
+                            "name": plant,
+                            "id": tile_id,
+                            "ticks_until_mature": ticks_until_mature,
+                            "ticks_until_decayed": ticks_until_decayed,
+                            "maturity": age,
+                            "age_at_next_tick": age_at_next_tick
+                        }
                 else:
-                    self.plants[plant]["growing"] = True
                     self.plants[plant]["ticks_until_mature"] = 0  # Set to zero if the plant is already unlocked
-                    ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
-                    ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
-                    age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 \
-                        else age + avg_age_per_tick
+                    self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
+                                                                    ticks_until_decayed)
+                    self.plants[plant]["growing"] = True
+                    age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick
 
-                    self.occupied_tiles[tile["x"], tile["y"]] = {"name": plant,
-                                                                 "id": tile_id,
-                                                                 "ticks_until_mature": ticks_until_mature,
-                                                                 "ticks_until_decayed": ticks_until_decayed,
-                                                                 "maturity": age,
-                                                                 "age_at_next_tick": age_at_next_tick}
+                    self.occupied_tiles[tile["x"], tile["y"]] = {
+                        "name": plant,
+                        "id": tile_id,
+                        "ticks_until_mature": ticks_until_mature,
+                        "ticks_until_decayed": ticks_until_decayed,
+                        "maturity": age,
+                        "age_at_next_tick": age_at_next_tick
+                    }
 
                 self.plants_by_id[tile_id]["unlocked"] = self.plants[plant]["unlocked"]
                 self.plants_by_id[tile_id]["growing"] = self.plants[plant]["growing"]
@@ -611,16 +588,21 @@ class CookieClicker:
                 self.plants_by_id[tile_id]["ticks_until_decayed"] = self.plants[plant]["ticks_until_decayed"]
         except JavascriptException:
             self.click_cookie()
+            return
 
         try:
-            self.num_plants_unlocked = self.driver.execute_script(f"javascript:return "
-                                                                  f"{self.farm_minigame}.plantsUnlockedN")
+            self.num_plants_unlocked = self.driver.execute_script(
+                f"javascript:return {self.farm_minigame}.plantsUnlockedN")
         except JavascriptException:
             self.num_plants_unlocked = 0
 
-        locked_plants_growing = [p for p in self.plants if self.plants[p]["growing"] and not self.plants[p]["unlocked"]]
-        plants_left_to_unlock = [s for s, p in self.unlock_seed_od.items() if not self.plants[s]["growing"] and
-                                 not self.plants[s]["unlocked"]]
+        locked_plants_growing = [
+            p for p in self.plants if self.plants[p]["growing"] and not self.plants[p]["unlocked"]
+        ]
+        plants_left_to_unlock = [
+            s for s, p in self.unlock_seed_od.items() if
+            not self.plants[s]["growing"] and not self.plants[s]["unlocked"]
+        ]
         self.num_locked_plants_growing = len(locked_plants_growing)
 
         for key in locked_plants_growing:
@@ -921,10 +903,6 @@ class CookieClicker:
             else:
                 sg_avg_ticks_until_mature = ticks_until_mature_sum / planted_immature_tiles
 
-        # sg_avg_ticks_until_mature = (
-        #     ticks_until_mature_sum / planted_tiles if planted_tiles > 0 else self.plant_ticks_until_mature(
-        #         plant=self.plants_by_id[slower_plant_id]['key']))
-
         if sg_oldest_tile:
             sg_min_ticks_until_mature = self.plant_ticks_until_mature(plant=self.plants_by_id[slower_plant_id]['key'],
                                                                       x=sg_oldest_tile['x'], y=sg_oldest_tile['y'])
@@ -933,7 +911,6 @@ class CookieClicker:
                   f"ticks until mature: {sg_avg_ticks_until_mature}. Immature plants remaining: "
                   f"{planted_immature_tiles}.")
 
-        # if sg_oldest_age_at_next_tick > self.plants_by_id[slower_plant_id]["mature"]:
         if sg_avg_age_at_next_tick > self.plants_by_id[slower_plant_id]["mature"]:
             slower_plant_ticks_until_mature = 0
         else:
@@ -993,10 +970,6 @@ class CookieClicker:
                 fg_avg_ticks_until_mature = 0
             else:
                 fg_avg_ticks_until_mature = ticks_until_mature_sum / planted_immature_tiles
-
-        # fg_avg_ticks_until_mature = (
-        #     ticks_until_mature_sum / planted_tiles if planted_tiles > 0 else self.plant_ticks_until_mature(
-        #         plant=self.plants_by_id[faster_plant_id]['key']))
 
         if fg_oldest_tile:
             fg_min_ticks_until_mature = self.plant_ticks_until_mature(plant=self.plants_by_id[faster_plant_id]['key'],
@@ -1060,11 +1033,6 @@ class CookieClicker:
 
         if self.is_seed_unlocked_or_growing('queenbeetLump') and self.dragon_complete:
             self.set_dragon_auras(dragon_aura=self.final_wanted_aura)
-            # try:
-            #     self.driver.execute_script(f"javascript:Game.SetDragonAura({self.final_wanted_aura},0);"
-            #                                "Game.ConfirmPrompt();")
-            # except JavascriptException:
-            #     self.click_cookie()
 
         growing_seeds = {plant: self.plants[plant]["ticks_until_mature"]
                          for plant in self.plants
@@ -1093,15 +1061,11 @@ class CookieClicker:
                         continue
 
                     parent_seed_maturity = self.plants[parent_seed]["mature"]
-                    # parent_age_per_tick = self.plants[parent_seed]["ageTick"] + (self.plants[parent_seed]["ageTickR"]
-                    #                                                              * 0.5)
 
                     parent_tiles = [plant['ticks_until_mature'] for (tile, plant) in self.occupied_tiles.items()
                                     if {'x': tile[0], 'y': tile[1]} in self.same_plant_setup
                                     and plant['name'] == parent_seed]
 
-                    # parent_ticks_until_mature = parent_seed_maturity / parent_age_per_tick if len(parent_tiles) == 0 \
-                    #     else sum(parent_tiles) / len(parent_tiles)
                     parent_ticks_until_mature = self.plant_ticks_until_mature(plant=parent_seed) if len(
                         parent_tiles) == 0 \
                         else sum(parent_tiles) / len(parent_tiles)
@@ -1187,10 +1151,8 @@ class CookieClicker:
 
                     if avg_seed_age >= parent_seed_maturity and parent_seed != "meddleweed" and \
                             seed != "meddleweed":
-                        # self.switch_soil("woodchips")
                         self.desired_soil = "woodchips"
                     else:
-                        # self.switch_soil("fertilizer")
                         self.desired_soil = "fertilizer"
                     seed_processed = True
                 elif num_parents == 2:
@@ -1358,7 +1320,6 @@ class CookieClicker:
         self.attempt_to_unlock_seeds = False
 
         if not seed_processed:
-            # self.switch_soil('fertilizer')
             self.desired_soil = "fertilizer"
             if (self.num_locked_plants_growing + self.num_plants_unlocked) != self.max_plants:
                 self.clean_garden(tiles=self.occupied_tiles)
@@ -1370,7 +1331,6 @@ class CookieClicker:
                       f"Cleaning garden and switching to fertilizer.{Style.RESET_ALL}")
 
         if (self.num_locked_plants_growing + self.num_plants_unlocked) == self.max_plants:
-            # self.switch_soil('fertilizer')
             self.desired_soil = "fertilizer"
             print(f"{timestamp()}: All seeds either unlocked or growing. Switching to fertilizer.")
 
@@ -1409,18 +1369,20 @@ class CookieClicker:
                                                     self.num_locked_plants_growing) == self.max_plants):
             return
         # Two plant configuration
-        gc_cost_js = f'javascript:return {self.farm_minigame}.plants["goldenClover"].cost'
-        nt_cost_js = f'javascript:return {self.farm_minigame}.plants["nursetulip"].cost'
+        gc_cost_js = f'{self.farm_minigame}.plants["goldenClover"].cost'
+        nt_cost_js = f'{self.farm_minigame}.plants["nursetulip"].cost'
         try:
-            gc_cost = self.driver.execute_script(gc_cost_js)
-            nt_cost = self.driver.execute_script(nt_cost_js)
-            cookies = self.driver.execute_script("javascript:return Game.cookies;")
+            gc_cost, nt_cost, cookies, cps = self.driver.execute_script(f'javascript:return [{gc_cost_js}, '
+                                                                        f'{nt_cost_js}, '
+                                                                        "Game.cookies, "
+                                                                        "Game.cookiesPs]")
+            # nt_cost = self.driver.execute_script(nt_cost_js)
+            # cookies = self.driver.execute_script("javascript:return Game.cookies;")
         except JavascriptException:
             print(f"{timestamp()}: Error calculating costs. Skipping increase_golden_cookie_frequency.")
             return
 
-        if (gc_cost + nt_cost) * 18 > cookies:
-            print(f"{timestamp()}: Cost exceeds cookies. Have: {cookies}. Need: {(gc_cost + nt_cost) * 18}.")
+        if (gc_cost + nt_cost) * 18 * 60 * cps > cookies:
             return
 
         nursetulip_layout = []
@@ -1591,24 +1553,10 @@ class CookieClicker:
                                 self.click_cookie()
                     except KeyError:
                         self.click_cookie()
-                    # if self.get_plant_id_of_tile(x=tile['x'], y=tile['y']) not in [self.plants["keenmoss"]["id"],
-                    #                                                                self.invalid_plant_id,
-                    #                                                                self.empty_tile_plant_id,
-                    #                                                                self.plants[upgrade["seed"]]["id"]]:
-                    #     try:
-                    #         self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},"
-                    #                                    f"{tile['y']})")
-                    #         if self.cpsMult > 1:
-                    #             self.last_buffed_harvest = time.time()
-                    #     except JavascriptException:
-                    #         self.click_cookie()
-                    # Replant Keenmoss if tile is now empty
                     try:
                         self.occupied_tiles[tile['x'], tile['y']]
                     except KeyError:
                         self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
-                    # if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
-                    #     self.plant_seed(x=tile["x"], y=tile["y"], seed_id=self.plants["keenmoss"]["id"])
 
         def strategy_4(upgrade):
             garden_upgrade_seed_id = self.plants[upgrade["seed"]]["id"]
@@ -1647,30 +1595,12 @@ class CookieClicker:
                                 self.click_cookie()
                     except KeyError:
                         self.click_cookie()
-                    # plant_id = self.get_plant_id_of_tile(x=tile["x"], y=tile["y"])
-                    # if plant_id == garden_upgrade_seed_id:
-                    #     # self.harvest_mature_plants(x=tile["x"], y =tile["y"])
-                    #     sg_oldest_age_at_next_tick = max(sg_oldest_age_at_next_tick,
-                    #                                      self.plant_age_at_next_tick(x=tile["x"], y=tile["y"]))
-                    # # Harvest plants from previous run
-                    # elif plant_id not in [self.plants["keenmoss"]["id"],
-                    #                       self.invalid_plant_id,
-                    #                       self.empty_tile_plant_id]:
-                    #     try:
-                    #         self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},"
-                    #                                    f"{tile['y']})")
-                    #         if self.cpsMult > 1:
-                    #             self.last_buffed_harvest = time.time()
-                    #     except JavascriptException:
-                    #         self.click_cookie()
 
                     # Replant Keenmoss if tile is now empty
                     try:
                         self.occupied_tiles[tile['x'], tile['y']]
                     except KeyError:
                         empty_tiles.append(tile)
-                    # if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
-                    #     empty_tiles.append(tile)
 
                 if sg_oldest_age_at_next_tick > self.plants[upgrade["seed"]]["mature"]:
                     slower_plant_ticks_until_mature = 0
@@ -1716,28 +1646,11 @@ class CookieClicker:
                             sg_oldest_age_at_next_tick = max(sg_oldest_age_at_next_tick, plant_data['age_at_next_tick'])
                     except KeyError:
                         self.click_cookie()
-                    # plant_id = self.get_plant_id_of_tile(x=tile["x"], y=tile["y"])
-                    # if plant_id not in [self.empty_tile_plant_id, self.invalid_plant_id,
-                    #                     garden_upgrade_seed_id, self.plants["keenmoss"]["id"]]:
-                    #     try:
-                    #         self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},"
-                    #                                    f"{tile['y']})")
-                    #         if self.cpsMult > 1:
-                    #             self.last_buffed_harvest = time.time()
-                    #     except JavascriptException:
-                    #         self.click_cookie()
-                    # elif plant_id == garden_upgrade_seed_id:
-                    #     # if not keenmoss_tiles:
-                    #     #     self.harvest_mature_plants(x=tile["x"], y=tile["y"])
-                    #     sg_oldest_age_at_next_tick = max(sg_oldest_age_at_next_tick,
-                    #                                      self.plant_age_at_next_tick(x=tile["x"], y=tile["y"]))
 
                     try:
                         self.occupied_tiles[tile['x'], tile['y']]
                     except KeyError:
                         empty_tiles.append(tile)
-                    # if self.get_plant_id_of_tile(x=tile["x"], y=tile["y"]) == self.empty_tile_plant_id:
-                    #     empty_tiles.append(tile)
 
                 if sg_oldest_age_at_next_tick > self.plants[upgrade["seed"]]["mature"]:
                     slower_plant_ticks_until_mature = 0
@@ -1815,25 +1728,11 @@ class CookieClicker:
                 except KeyError:
                     self.click_cookie()
 
-                # plant_id = self.get_plant_id_of_tile(x=keenmoss_tile["x"], y=keenmoss_tile["y"])
-                # if plant_id not in [self.empty_tile_plant_id,
-                #                     self.invalid_plant_id,
-                #                     self.plants["keenmoss"]["id"]] and self.plants_by_id[plant_id]['unlocked']:
-                #     try:
-                #         self.driver.execute_script(f"javascript:{self.farm_minigame}."
-                #                                    f"harvest({keenmoss_tile['x']}, {keenmoss_tile['y']})")
-                #     except JavascriptException:
-                #         self.click_cookie()
-
                 try:
                     self.occupied_tiles[keenmoss_tile["x"], keenmoss_tile["y"]]
                 except KeyError:
                     self.click_cookie()
                     self.plant_seed(x=keenmoss_tile["x"], y=keenmoss_tile["y"], seed_id=self.plants["keenmoss"]["id"])
-
-                # plant_id = self.get_plant_id_of_tile(x=keenmoss_tile["x"], y=keenmoss_tile["y"])
-                # if plant_id == self.empty_tile_plant_id:
-                #     self.plant_seed(x=keenmoss_tile["x"], y=keenmoss_tile["y"], seed_id=self.plants["keenmoss"]["id"])
 
             for ichorpuff_tile in ichorpuff_tiles:
                 self.click_cookie()
@@ -1853,27 +1752,12 @@ class CookieClicker:
                 except KeyError:
                     self.click_cookie()
 
-                # plant_id = self.get_plant_id_of_tile(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"])
-                # if plant_id not in [self.empty_tile_plant_id,
-                #                     self.invalid_plant_id,
-                #                     self.plants["ichorpuff"]["id"]] and self.plants_by_id[plant_id]['unlocked']:
-                #     try:
-                #         self.driver.execute_script(f"javascript:{self.farm_minigame}."
-                #                                    f"harvest({ichorpuff_tile['x']}, {ichorpuff_tile['y']})")
-                #     except JavascriptException:
-                #         self.click_cookie()
-
                 try:
                     self.occupied_tiles[ichorpuff_tile["x"], ichorpuff_tile["y"]]
                 except KeyError:
                     self.click_cookie()
                     self.plant_seed(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"],
                                     seed_id=self.plants["ichorpuff"]["id"])
-
-                # plant_id = self.get_plant_id_of_tile(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"])
-                # if plant_id == self.empty_tile_plant_id:
-                #     self.plant_seed(x=ichorpuff_tile["x"], y=ichorpuff_tile["y"],
-                #                     seed_id=self.plants["ichorpuff"]["id"])
 
         upgrade_unlocked = True
         next_drop = None
@@ -1900,9 +1784,6 @@ class CookieClicker:
                 if self.farm_level >= 8:
                     strategy_5()
 
-        # self.get_dragon_auras()
-
-        # wanted_aura = self.dragon_auras_lookup["No aura"]["id"]
         if not self.all_garden_drops_unlocked:
             # wanted_aura = 14  # Mind over Matter
             wanted_aura = self.dragon_auras_lookup["Mind Over Matter"]["id"]
@@ -1912,10 +1793,6 @@ class CookieClicker:
 
         if self.dragon_complete:
             self.set_dragon_auras(dragon_aura=wanted_aura)
-            # try:
-            #     self.driver.execute_script(f"javascript:Game.SetDragonAura({wanted_aura},0);Game.ConfirmPrompt();")
-            # except JavascriptException:
-            #     self.click_cookie()
 
     def get_farm_level(self):
         try:
@@ -1932,10 +1809,8 @@ class CookieClicker:
 
     def get_plant_id_of_tile(self, x, y):
         try:
-            # plant_id = int(self.driver.execute_script(f"javascript:return {self.farm_minigame}."
-            #                                           f"getTile({x},{y})[0];")) - 1
             plant_id = self.plot[y][x][0] - 1
-        except JavascriptException:
+        except (IndexError, TypeError):
             plant_id = self.invalid_plant_id
         except InvalidSessionIdException:
             plant_id = self.invalid_plant_id
@@ -1943,9 +1818,7 @@ class CookieClicker:
         return plant_id
 
     def get_plant_maturity_of_tile(self, x, y):
-        # maturity_js = f"javascript:return {self.farm_minigame}.getTile({x},{y})[1];"
         try:
-            # return int(self.driver.execute_script(maturity_js))
             return self.plot[y][x][1]
         except JavascriptException:
             return 0
@@ -1955,11 +1828,15 @@ class CookieClicker:
             return
 
         if time.time() >= self.next_soil_time:
-            desired_soil_id_js = f"javascript:return {self.farm_minigame}.soils['{self.desired_soil}'].id;"
+            # desired_soil_id_js = f"javascript:return {self.farm_minigame}.soils['{self.desired_soil}'].id;"
+            desired_soil_id_js = f"{self.farm_minigame}.soils['{self.desired_soil}'].id;"
             try:
-                desired_soil_id = self.driver.execute_script(desired_soil_id_js)
-                current_soil_id_js = f"javascript:return {self.farm_minigame}.soil;"
-                current_soil_id = self.driver.execute_script(current_soil_id_js)
+                # desired_soil_id = self.driver.execute_script(desired_soil_id_js)
+                # current_soil_id_js = f"javascript:return {self.farm_minigame}.soil;"
+                current_soil_id_js = f"{self.farm_minigame}.soil;"
+                desired_soil_id, current_soil_id = self.driver.execute_script(f"javascript:return [desired_soil_id_js, "
+                                                                              f"current_soil_id_js]")
+                # current_soil_id = self.driver.execute_script(current_soil_id_js)
             except JavascriptException:
                 self.click_cookie()
                 return
@@ -1977,53 +1854,61 @@ class CookieClicker:
 
     def get_active_buffs(self):
         try:
-            self.f_active = self.driver.execute_script("javascript:return 'Frenzy' in Game.buffs")
-            self.bs_active = self.driver.execute_script("javascript:return 'High-five' in Game.buffs ||"
-                                                        "'Congregation' in Game.buffs ||"
-                                                        "'Luxuriant harvest' in Game.buffs ||"
-                                                        "'Ore vein' in Game.buffs ||"
-                                                        "'Oiled-up' in Game.buffs ||"
-                                                        "'Juicy profits' in Game.buffs ||"
-                                                        "'Fervent adoration' in Game.buffs ||"
-                                                        "'Manabloom' in Game.buffs ||"
-                                                        "'Delicious lifeforms' in Game.buffs ||"
-                                                        "'Breakthrough' in Game.buffs ||"
-                                                        "'Righteous cataclysm' in Game.buffs ||"
-                                                        "'Golden ages' in Game.buffs ||"
-                                                        "'Extra cycles' in Game.buffs ||"
-                                                        "'Solar flare' in Game.buffs ||"
-                                                        "'Winning streak' in Game.buffs ||"
-                                                        "'Macrocosm' in Game.buffs ||"
-                                                        "'Refactoring' in Game.buffs ||"
-                                                        "'Cosmic nursery' in Game.buffs ||"
-                                                        "'Brainstorm' in Game.buffs ||"
-                                                        "'Deduplication' in Game.buffs;")
-            self.dh_active = self.driver.execute_script("javascript:return 'Dragon Harvest' in Game.buffs")
-            self.df_active = self.driver.execute_script("javascript:return 'Dragonflight' in Game.buffs")
-            self.cf_active = self.driver.execute_script("javascript:return 'Click frenzy' in Game.buffs")
-            self.ef_active = self.driver.execute_script("javascript:return 'Elder frenzy' in Game.buffs")
-            self.cursed_finger_active = self.driver.execute_script("javascript:return 'Cursed finger' in Game.buffs")
-            self.debuff_active = self.driver.execute_script("javascript:return 'Clot' in Game.buffs ||"
-                                                            "'Slap to the face' in Game.buffs ||"
-                                                            "'Senility' in Game.buffs ||"
-                                                            "'Locusts' in Game.buffs ||"
-                                                            "'Cave-in' in Game.buffs ||"
-                                                            "'Jammed machinery' in Game.buffs ||"
-                                                            "'Recession' in Game.buffs ||"
-                                                            "'Crisis of faith' in Game.buffs ||"
-                                                            "'Magivores' in Game.buffs ||"
-                                                            "'Black holes' in Game.buffs ||"
-                                                            "'Lab disaster' in Game.buffs ||"
-                                                            "'Dimensional calamity' in Game.buffs ||"
-                                                            "'Time jam' in Game.buffs ||"
-                                                            "'Predictable tragedy' in Game.buffs ||"
-                                                            "'Eclipse' in Game.buffs ||"
-                                                            "'Dry spell' in Game.buffs ||"
-                                                            "'Microcosm' in Game.buffs ||"
-                                                            "'Antipattern' in Game.buffs ||"
-                                                            "'Big crunch' in Game.buffs ||"
-                                                            "'Brain freeze' in Game.buffs ||"
-                                                            "'Clone strike' in Game.buffs;")
+            script = """
+            return [
+                'Frenzy' in Game.buffs,
+                'High-five' in Game.buffs ||
+                       'Congregation' in Game.buffs ||
+                       'Luxuriant harvest' in Game.buffs ||
+                       'Ore vein' in Game.buffs ||
+                       'Oiled-up' in Game.buffs ||
+                       'Juicy profits' in Game.buffs ||
+                       'Fervent adoration' in Game.buffs ||
+                       'Manabloom' in Game.buffs ||
+                       'Delicious lifeforms' in Game.buffs ||
+                       'Breakthrough' in Game.buffs ||
+                       'Righteous cataclysm' in Game.buffs ||
+                       'Golden ages' in Game.buffs ||
+                       'Extra cycles' in Game.buffs ||
+                       'Solar flare' in Game.buffs ||
+                       'Winning streak' in Game.buffs ||
+                       'Macrocosm' in Game.buffs ||
+                       'Refactoring' in Game.buffs ||
+                       'Cosmic nursery' in Game.buffs ||
+                       'Brainstorm' in Game.buffs ||
+                       'Deduplication' in Game.buffs,
+                'Dragon Harvest' in Game.buffs,
+                'Dragonflight' in Game.buffs,
+                'Click frenzy' in Game.buffs,
+                'Elder frenzy' in Game.buffs,
+                'Cursed finger' in Game.buffs,
+                'Clot' in Game.buffs ||
+                           'Slap to the face' in Game.buffs ||
+                           'Senility' in Game.buffs ||
+                           'Locusts' in Game.buffs ||
+                           'Cave-in' in Game.buffs ||
+                           'Jammed machinery' in Game.buffs ||
+                           'Recession' in Game.buffs ||
+                           'Crisis of faith' in Game.buffs ||
+                           'Magivores' in Game.buffs ||
+                           'Black holes' in Game.buffs ||
+                           'Lab disaster' in Game.buffs ||
+                           'Dimensional calamity' in Game.buffs ||
+                           'Time jam' in Game.buffs ||
+                           'Predictable tragedy' in Game.buffs ||
+                           'Eclipse' in Game.buffs ||
+                           'Dry spell' in Game.buffs ||
+                           'Microcosm' in Game.buffs ||
+                           'Antipattern' in Game.buffs ||
+                           'Big crunch' in Game.buffs ||
+                           'Brain freeze' in Game.buffs ||
+                           'Clone strike' in Game.buffs
+            ];
+            """
+            buffs = self.driver.execute_script(f"javascript:{script}")
+            (self.f_active, self.bs_active, self.dh_active, self.df_active,
+             self.cf_active, self.ef_active, self.cursed_finger_active,
+             self.debuff_active) = buffs
         except JavascriptException:
             self.debuff_active = False
             self.f_active = self.bs_active = self.dh_active = self.df_active = self.cf_active = self.ef_active = False
@@ -2031,228 +1916,209 @@ class CookieClicker:
             return
 
     def cast_spell(self, spell_to_cast, exhaust_magic=False):
-        game = "Game.Objects['Wizard tower'].minigame"
+        game = 'Game.Objects["Wizard tower"].minigame'
         spell = f'{game}.spells["{spell_to_cast}"]'
         fthof = f'{game}.spells["hand of fate"]'
         gfd = f'{game}.spellsById[6]'  # Gambler's Fever Dream
         scp = f'{game}.spellsById[5]'  # Summon Crafty Pixies
-        gfd_green_fthof = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate')
-        gfd_green_fthof_cf = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Click Frenzy)')
-        gfd_green_fthof_bs = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Building Special)')
-        gfd_green_fthof_frenzy = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                                  '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Frenzy)')
-        gfd_good_fthof_lucky = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                                '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Lucky)')
-        gfd_good_fthof_blab = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Blab)')
-        gfd_ef_fthof = ('<div width="100%"><b>Forecast:</b><br/><span class="red">'
-                        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Elder Frenzy)')
-        gfd_red_fthof_lump = ('<div width="100%"><b>Forecast:</b><br/><span class="red">'
-                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Free Sugar Lump')
+        gfd_forecasts = {
+            "green_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate',
+            "green_fthof_cf": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Click Frenzy)',
+            "green_fthof_bs": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Building Special)',
+            "green_fthof_frenzy": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                                  '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Frenzy)',
+            "good_fthof_lucky": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                                '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Lucky)',
+            "good_fthof_blab": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Blab)',
+            "ef_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
+                        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Elder Frenzy)',
+            "red_fthof_lump": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
+                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Free Sugar Lump'
+        }
         buffer = 21
+
+        def execute_js(script):
+            try:
+                return self.driver.execute_script(f"javascript:return {script}")
+            except JavascriptException:
+                self.click_cookie()
+                return None
+
         try:
-            spell_cost = self.driver.execute_script(f"javascript:return {game}.getSpellCost({spell});")
-            magic = self.driver.execute_script(f"javascript:return {game}.magic")
-            magic_max = self.driver.execute_script(f"javascript:return {game}.magicM")
-            current_lumps = int(self.driver.execute_script("javascript:return Game.lumps"))
+            magic, magic_max, spell_cost, current_lumps = self.driver.execute_script(f'return [{game}.magic,'
+                                                                                     f'{game}.magicM,'
+                                                                                     f'{game}.getSpellCost({spell}),'
+                                                                                     'Game.lumps]')
         except JavascriptException:
-            self.click_cookie()
+            magic = magic_max = spell_cost = current_lumps = None
+            print(f"{timestamp()}: Error with javascript on cast_spell.")
+
+        if magic is None or magic_max is None or spell_cost is None or current_lumps is None:
             return
 
         if spell_to_cast == "gambler's fever dream":
-            try:
-                fthof_half_cost = self.driver.execute_script(f"javascript:return {game}.getSpellCost({fthof})/ 2;")
-            except JavascriptException:
-                fthof_half_cost = magic
+            fthof_half_cost = execute_js(f"{game}.getSpellCost({fthof}) / 2") or magic
 
             if magic < (spell_cost + fthof_half_cost) * 2:
                 self.click_golden_cookies = False
                 print(f'{timestamp()}: Waiting for enough magic to get Four-leaf cookie')
                 return
-            else:
-                for _ in range(2):
-                    self.click_cookie()
-                    try:
-                        self.driver.execute_script(f"javascript:{game}.castSpell({spell});")
-                    except JavascriptException:
-                        self.driver.quit()
-                try:
-                    self.driver.find_element(by=By.ID, value="grimoireLumpRefill").click()
-                    self.driver.execute_script(f"javascript:{game}.castSpell(fthof);")
-                    four_leaf_cookie_achievement = self.check_achievements('Four-leaf cookie')
-                    while not four_leaf_cookie_achievement:
-                        four_leaf_cookie_achievement = self.check_achievements('Four-leaf cookie')
-                    self.click_golden_cookies = True
-                except (JavascriptException, ElementClickInterceptedException, NoSuchElementException):
-                    self.driver.quit()
-        else:
-            try:
-                spells_cast = self.driver.execute_script(f'javascript:return {game}.spellsCastTotal')
-            except JavascriptException:
+
+            for _ in range(2):
                 self.click_cookie()
-                print(f'{timestamp()}: Error getting FTHOF cookie details.')
-                return
+                execute_js(f"{game}.castSpell({spell})")
 
-            if spells_cast == self.spell_count_four_leaf_cookie:
-                return
+            execute_js("FireEvent(l('grimoireLumpRefill'), 'click')")
+            print(f"{timestamp()}: Spending one lump to refill Grimoire.")
+            execute_js(f"{game}.castSpell({fthof})")
+            while not self.check_achievements('Four-leaf cookie'):
+                pass
+            self.click_golden_cookies = True
 
-            if magic_max - magic >= 100 and not self.debuff_active and current_lumps > 101:
+            return
+
+        spells_cast = execute_js(f"{game}.spellsCastTotal")
+        if spells_cast == self.spell_count_four_leaf_cookie or spells_cast is None:
+            return
+
+        gfd_result = execute_js(f"FortuneCookie.spellForecast({gfd})")
+        gfd_is_good_fthof = (gfd_result.startswith(gfd_forecasts['green_fthof']) and
+                             not gfd_result.startswith(gfd_forecasts["good_fthof_blab"])
+                             ) or any(gfd_result.startswith(gfd_forecasts[key]) for key in
+                                      ["ef_fthof", "red_fthof_lump"]) if gfd_result else False
+
+        if magic_max - magic >= 100 and not self.debuff_active and current_lumps > 101:
+            cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
+            click_buffs = self.cf_active + self.df_active
+            gfd_f = gfd_result.startswith(gfd_forecasts["green_fthof_frenzy"]) if gfd_result else False
+            gfd_bs = gfd_result.startswith(gfd_forecasts["green_fthof_bs"]) if gfd_result else False
+            gfd_ef = gfd_result.startswith(gfd_forecasts["ef_fthof"]) if gfd_result else False
+            gfd_cf = gfd_result.startswith(gfd_forecasts["green_fthof_cf"]) if gfd_result else False
+            gfd_cps_buff = gfd_f or gfd_bs or gfd_ef
+
+            next_cookie_js = (f"FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' || "
+                              f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 * "
+                              f"FortuneCookie.getSimGCs(), false)")
+            next_cookie = execute_js(next_cookie_js)
+            fthof_frenzy = ">Frenzy<" in next_cookie
+            fthof_cf = ">Click Frenzy<" in next_cookie
+            fthof_bs = ">Building Special<" in next_cookie
+            fthof_ef = ">Elder Frenzy<" in next_cookie
+            fthof_cps_buff = fthof_frenzy or fthof_bs or fthof_ef
+
+            if (cps_buffs >= 2 and (self.swaps_left > 2 or current_lumps > 102) and
+                (gfd_cf or
+                 (not gfd_is_good_fthof and
+                  fthof_cf))) or (click_buffs and
+                                  ((self.f_active and
+                                    (gfd_bs or gfd_ef or (not gfd_is_good_fthof and (fthof_bs or fthof_ef)))) or
+                                   (self.ef_active and
+                                    (gfd_bs or gfd_f or (not gfd_is_good_fthof and (fthof_frenzy or fthof_bs)))) or
+                                   (self.bs_active and
+                                    (gfd_cps_buff or (not gfd_is_good_fthof and fthof_cps_buff))))):
+                execute_js("FireEvent(l('grimoireLumpRefill'), 'click')")
+                print(f"{timestamp()}: {Fore.RED}Spent a lump (had: {current_lumps}) on refilling 100 magic to "
+                      f"Grimoire. Magic was {magic}. {self.swaps_left} swaps left.{Style.RESET_ALL}")
+                magic = execute_js(f"{game}.magic")
+
+        fthof_half_cost = execute_js(f"{game}.getSpellCost({fthof}) / 2")
+        gfd_cost = execute_js(f"{game}.getSpellCost({gfd})")
+        gfd_is_good_fthof = magic >= (gfd_cost + fthof_half_cost) and gfd_is_good_fthof
+
+        buff = any([self.f_active, self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
+
+        cast = magic >= magic_max - 1 or (magic >= spell_cost and buff and
+                                          spell_to_cast == "hand of fate") or gfd_is_good_fthof
+
+        if spell_to_cast == 'summon crafty pixies':
+            print(f"{timestamp()}: Summon Crafty Pixies costs {spell_cost}. Have {magic} magic.")
+            if magic >= spell_cost:
+                scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
+                scp_result = execute_js(f"FortuneCookie.spellForecast({scp})")
+                # print(f"{timestamp()}: {scp_result}")
+                cast = scp_result.startswith(scp_success) if scp_result else False
+            else:
+                cast = False
+
+        while cast:
+            if spell_to_cast == "hand of fate":
+                next_cookie_js = (f"FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' ||"
+                                  f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 *"
+                                  f"FortuneCookie.getSimGCs(), false)")
+                next_cookie = execute_js(next_cookie_js)
+                fthof_results = {
+                    "lucky": ">Lucky<" in next_cookie,
+                    "frenzy": ">Frenzy<" in next_cookie,
+                    "click_frenzy": ">Click Frenzy<" in next_cookie,
+                    "cookie_storm": "Cookie Storm" in next_cookie,
+                    "blab": ">Blab<" in next_cookie,
+                    "building_special": ">Building Special<" in next_cookie,
+                    "free_sugar_lump": ">Free Sugar Lump<" in next_cookie,
+                    "clot": ">Clot<" in next_cookie,
+                    "ruin": ">Ruin<" in next_cookie,
+                    "cursed_finger": ">Cursed Finger<" in next_cookie,
+                    "elder_frenzy": ">Elder Frenzy<" in next_cookie
+                }
                 cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
-                click_buffs = self.cf_active + self.df_active
-                try:
-                    gfd_result = self.driver.execute_script(f"javascript:return FortuneCookie.spellForecast({gfd});")
-                    gfd_is_good_fthof = (gfd_result.startswith(gfd_green_fthof) and
-                                         not gfd_result.startswith(gfd_good_fthof_blab)
-                                         ) or (gfd_result.startswith(gfd_ef_fthof) or
-                                               gfd_result.startswith(gfd_red_fthof_lump))
-                    gfd_f = gfd_result.startswith(gfd_green_fthof_frenzy)
-                    gfd_bs = gfd_result.startswith(gfd_green_fthof_bs)
-                    gfd_ef = gfd_result.startswith(gfd_ef_fthof)
-                    gfd_cf = gfd_result.startswith(gfd_green_fthof_cf)
-                    gfd_cps_buff = gfd_f or gfd_bs or gfd_ef
-                    next_cookie_js = (f"FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' || "
-                                      f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 * "
-                                      f"FortuneCookie.getSimGCs(), false)")
-                    next_cookie = self.driver.execute_script(f"javascript:return {next_cookie_js}")
-                    fthof_frenzy = ">Frenzy<" in next_cookie
-                    fthof_cf = ">Click Frenzy<" in next_cookie
-                    fthof_bs = ">Building Special<" in next_cookie
-                    fthof_ef = ">Elder Frenzy<" in next_cookie
-                    fthof_cps_buff = fthof_frenzy or fthof_bs or fthof_ef
-                except JavascriptException:
-                    print(f"{timestamp()}: Failed to save GFD result to variable.")
-                    gfd_cps_buff = fthof_cps_buff = gfd_cf = fthof_frenzy = fthof_bs = fthof_ef = fthof_cf = False
-                    gfd_is_good_fthof = gfd_bs = gfd_ef = gfd_f = False
+                fthof_best = any([fthof_results[key] for key in ["frenzy", "click_frenzy", "cookie_storm",
+                                                                 "building_special", "free_sugar_lump", "elder_frenzy",
+                                                                 "cursed_finger"]])
+                no_frenzy_buff = any([self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
 
-                if (cps_buffs >= 2 and
-                    (gfd_cf or
-                     (not gfd_is_good_fthof and
-                      fthof_cf))) or (click_buffs and
-                                      ((self.f_active and
-                                        (gfd_bs or gfd_ef or (not gfd_is_good_fthof and (fthof_bs or fthof_ef)))) or
-                                       (self.ef_active and
-                                        (gfd_bs or gfd_f or (not gfd_is_good_fthof and (fthof_frenzy or fthof_bs)))) or
-                                       (self.bs_active and
-                                        (gfd_cps_buff or (not gfd_is_good_fthof and fthof_cps_buff))))):
-                    try:
-                        self.driver.execute_script(f"javascript:FireEvent(l('grimoireLumpRefill'), 'click')")
-                        magic = self.driver.execute_script(f"javascript:return {game}.magic")
-                    except JavascriptException:
-                        self.click_cookie()
-                        print(f"{timestamp()}: Failed to use lump to refill magic.")
+                if any([fthof_results[key] for key in ["blab", "clot", "ruin"]]):
+                    if magic >= (gfd_cost + (2 * fthof_half_cost)):
+                        bad_spell = next((spell for spell in ["Blab", "Clot", "Ruin"] if fthof_results[spell.lower()]),
+                                         "Unknown")
 
-            try:
-                fthof_half_cost = self.driver.execute_script(f"javascript:return {game}.getSpellCost({fthof})/ 2;")
-                gfd_cost = self.driver.execute_script(f"javascript:return {game}.getSpellCost({gfd});")
-            except JavascriptException:
-                self.click_cookie()
-                return
+                        try:
+                            self.driver.execute_script(f"javascript:{game}.castSpell({gfd})")
+                            self.save_game(path=self.save_file)
+                            print(
+                                f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid FTHOF {bad_spell}. "
+                                f"Magic was {magic}.{Style.RESET_ALL}")
+                            time.sleep(1)
+                            self.load_save()
 
-            if magic >= (gfd_cost + fthof_half_cost):
-                try:
-                    gfd_result = self.driver.execute_script(f"javascript:return FortuneCookie.spellForecast({gfd});")
-                    gfd_is_good_fthof = (gfd_result.startswith(gfd_green_fthof) and
-                                         not gfd_result.startswith(gfd_good_fthof_blab)
-                                         ) or (gfd_result.startswith(gfd_ef_fthof) or
-                                               gfd_result.startswith(gfd_red_fthof_lump))
-                except JavascriptException:
-                    print(f"{timestamp()}: Failed to save GFD result to variable.")
-                    gfd_is_good_fthof = False
+                        except JavascriptException:
+                            print(f"{timestamp()}: Failed to cast Gambler's Fever Dream to avoid FTHOF {bad_spell}.")
+                            return
+
+                elif magic >= magic_max - 1 or (self.debuff_active and fthof_results["cursed_finger"]) or \
+                        fthof_results["free_sugar_lump"] or (
+                        no_frenzy_buff and not self.debuff_active and any(
+                    [fthof_results["frenzy"], fthof_results["click_frenzy"], fthof_results["cookie_storm"],
+                     fthof_results["building_special"], fthof_results["elder_frenzy"]])
+                ) or (buff and not self.debuff_active and any(
+                    [fthof_results["click_frenzy"], fthof_results["cookie_storm"],
+                     fthof_results["building_special"], fthof_results["elder_frenzy"]])
+                ) or (fthof_results["lucky"] and cps_buffs >= 2):
+                    if gfd_is_good_fthof and gfd_forecasts["good_fthof_lucky"] and not fthof_best:
+                        print(f"{timestamp()}: {Fore.GREEN}Casting Gambler's Fever Dream. Magic was {magic}."
+                              f"{Style.RESET_ALL}")
+                        execute_js(f"{game}.castSpell({gfd})")
+                    elif magic >= (2 * fthof_half_cost):
+                        print(f"{timestamp()}: {Fore.GREEN}Casting Force the Hand of Fate. Magic was {magic}."
+                              f"{Style.RESET_ALL}")
+                        execute_js(f"{game}.castSpell({spell})")
+                    self.set_cps_multiplier()
+                cast = False
             else:
-                gfd_is_good_fthof = False
-
-            buff = self.f_active or self.bs_active or self.dh_active or self.cf_active or (self.ef_active or
-                                                                                           self.df_active)
-
-            cast = (magic >= magic_max - 1) or (buff and magic >= spell_cost and
-                                                spell_to_cast == "hand of fate") or (gfd_is_good_fthof or
-                                                                                     self.debuff_active)
-
-            if spell_to_cast == 'summon crafty pixies':
-                if magic >= spell_cost:
-                    scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                                   '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
-                    scp_result = self.driver.execute_script(f"javascript:return FortuneCookie.spellForecast({scp});")
-
-                    if scp_result.startswith(scp_success):
-                        cast = True
-                    else:
-                        cast = False
-                else:
-                    cast = False
-
-            while cast:
                 if spell_to_cast == "resurrect abomination":
                     self.pop_fattest_wrinkler()
-                try:
-                    if spell_to_cast == "hand of fate":
-                        next_cookie_js = (f"FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' || "
-                                          f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 * "
-                                          f"FortuneCookie.getSimGCs(), false)")
-                        next_cookie = self.driver.execute_script(f"javascript:return {next_cookie_js}")
-                        lucky = ">Lucky<" in next_cookie
-                        frenzy = ">Frenzy<" in next_cookie
-                        click_frenzy = ">Click Frenzy<" in next_cookie
-                        cookie_storm = "Cookie Storm" in next_cookie
-                        blab = ">Blab<" in next_cookie
-                        building_special = ">Building Special<" in next_cookie
-                        free_sugar_lump = ">Free Sugar Lump<" in next_cookie
-                        clot = ">Clot<" in next_cookie
-                        ruin = ">Ruin<" in next_cookie
-                        cursed_finger = ">Cursed Finger<" in next_cookie
-                        elder_frenzy = ">Elder Frenzy<" in next_cookie
-                        cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
-                        fthof_best = (frenzy or click_frenzy or cookie_storm or building_special or free_sugar_lump or
-                                      elder_frenzy or cursed_finger)
-                        no_frenzy_buff = self.bs_active or self.dh_active or self.cf_active or (self.ef_active or
-                                                                                                self.df_active)
 
-                        if blab or clot or ruin:
-                            if magic >= (gfd_cost + (2 * fthof_half_cost)):
-                                if blab:
-                                    bad_spell = "Blab"
-                                elif clot:
-                                    bad_spell = "Clot"
-                                elif ruin:
-                                    bad_spell = "Ruin"
-                                else:
-                                    bad_spell = "Unknown"
-                                self.driver.execute_script(f'javascript:{game}.castSpell({gfd});')
-                                print(f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid FTHOF "
-                                      f"{bad_spell}. Magic was {magic}.{Style.RESET_ALL}")
-                                self.save_game(path=self.save_file)
-                                self.load_save()
-                        elif magic >= magic_max - 1 or (self.debuff_active and cursed_finger) or free_sugar_lump \
-                                or (no_frenzy_buff and not self.debuff_active and (frenzy or click_frenzy or
-                                                                                   cookie_storm or building_special or
-                                                                                   elder_frenzy)) \
-                                or (buff and not self.debuff_active and (click_frenzy or cookie_storm or
-                                                                         building_special or elder_frenzy)) \
-                                or (lucky and cps_buffs >= 2):
-                            if gfd_is_good_fthof and gfd_good_fthof_lucky and not fthof_best:
-                                print(f"{timestamp()}: Casting Gambler's Fever Dream. Magic was {magic}.")
-                                self.driver.execute_script(f'javascript:{game}.castSpell({gfd});')
-                            elif magic >= (2 * fthof_half_cost):
-                                print(f"{timestamp()}: Casting Force the Hand of Fate. Magic was {magic}.")
-                                self.driver.execute_script(f"javascript:{game}.castSpell({spell});")
-                            self.set_cps_multiplier()
-                        cast = False
-                    else:
-                        self.driver.execute_script(f"javascript:{game}.castSpell({spell});")
-                        if exhaust_magic:
-                            spell_cost = self.driver.execute_script(f"javascript:return {game}.getSpellCost({spell});")
-                            magic = self.driver.execute_script(f"javascript:return {game}.magic")
-                            cast = magic >= spell_cost + buffer
-                        else:
-                            cast = False
-                except JavascriptException:
-                    self.click_cookie()
-                    print(f"{timestamp()}: Failed to cast spell.")
-                    return
-
+                execute_js(f"{game}.castSpell({spell})")
+                print(f"{timestamp()}: {Fore.GREEN}Casting {spell_to_cast}.{Style.RESET_ALL}")
+                if exhaust_magic:
+                    spell_cost = execute_js(f"{game}.getSpellCost({spell})")
+                    magic = execute_js(f"{game}.magic")
+                    cast = magic >= spell_cost + buffer
+                else:
+                    cast = False
             self.click_golden_cookies = True
 
     def try_for_shriekbulbs(self):
@@ -2385,8 +2251,6 @@ class CookieClicker:
                     except KeyError:
                         self.click_cookie()
 
-                    # if self.get_plant_id_of_tile(jqb_x, jqb_y) == self.plants["queenbeetLump"]["id"]:
-                    #     jqb_tile = {"x": jqb_x, "y": jqb_y}
             x_offset = 0
             y_offset = 0
             if jqb_tile["x"] == 4:
@@ -2547,33 +2411,24 @@ class CookieClicker:
                     if p_id == self.empty_tile_plant_id:
                         clean_quadrant = True
                         break
-                    # age_at_next_tick = self.plant_age_at_next_tick(x=tile['x'], y=tile['y'])
                     age_at_next_tick = self.occupied_tiles[tile['x'], tile['y']]['age_at_next_tick']
                     if age_at_next_tick >= 100:
                         clean_quadrant = True
                         break
-                    # else:
-                    #     quadrant_max_maturity = max(quadrant_max_maturity,
-                    #                                 self.occupied_tiles[tile['x'], tile['y']]['maturity'])
-
-            # if self.cpsMult == 1 and self.next_garden_tick - time.time() > SECONDS_UNTIL_NEXT_TICK:
-            #     return quadrant_max_maturity
 
             if clean_quadrant:
                 quadrant_avg_age_next_tick = 0
-                cost_js = f'javascript:return {self.farm_minigame}.plants["queenbeet"].cost'
+                # cost_js = f'javascript:return {self.farm_minigame}.plants["queenbeet"].cost'
                 try:
-                    cps = self.driver.execute_script("javascript:return Game.cookiesPs;")
-                    cookies = self.driver.execute_script("javascript:return Game.cookies;")
-                    cost = self.driver.execute_script(cost_js)
+                    cps, cookies, cost = self.driver.execute_script("return [Game.cookiesPs, Game.cookies,"
+                                                                    f'{self.farm_minigame}.plants["queenbeet"].cost]')
+                    # cps = self.driver.execute_script("javascript:return Game.cookiesPs;")
+                    # cookies = self.driver.execute_script("javascript:return Game.cookies;")
+                    # cost = self.driver.execute_script(cost_js)
                 except JavascriptException:
                     self.click_cookie()
                     return quadrant_avg_age_next_tick
                 total_cost = cps * 60 * 8 * cost
-
-                # if duketater_ticks_until_mature - queenbeet_ticks_until_mature <= 0:
-                #     print(f"{timestamp()}: Duketater ({duketater_tile}) matures in {duketater_ticks_until_mature} "
-                #           f"ticks. Queenbeet takes {queenbeet_ticks_until_mature} ticks to mature")
 
                 if cookies >= total_cost and (duketater_ticks_until_mature - queenbeet_ticks_until_mature <= 0):
                     if duketater_tile and duketater_ticks_until_mature - queenbeet_ticks_until_mature <= 0:
@@ -2592,9 +2447,7 @@ class CookieClicker:
                             plant_unlocked = self.plants_by_id[p_id]["unlocked"]
                             plant_mature_age = self.plants_by_id[p_id]["mature"]
 
-                            if plant_unlocked or plant_age >= plant_mature_age:  # and \
-                                # (self.cpsMult >= 1 or
-                                #  self.next_garden_tick - time.time() <= SECONDS_UNTIL_NEXT_TICK):
+                            if plant_unlocked or plant_age >= plant_mature_age:
                                 try:
                                     self.driver.execute_script(f"javascript:{self.farm_minigame}.harvest({tile['x']},"
                                                                f"{tile['y']})")
@@ -2666,11 +2519,6 @@ class CookieClicker:
                     p_id = self.empty_tile_plant_id
                     plant_unlocked = False
 
-                # p_id = self.get_plant_id_of_tile(x=tile[0], y=tile[1])
-                # if p_id not in {self.invalid_plant_id, self.empty_tile_plant_id}:
-                #     plant_unlocked = self.plants_by_id[p_id]["unlocked"]
-                # else:
-                #     plant_unlocked = False
                 if p_id not in {self.empty_tile_plant_id, elderwort_id} and plant_unlocked:
                     print(f"{timestamp()}: Harvesting elderwort tiles if they don't contain elderwort.")
                     try:
@@ -2683,11 +2531,8 @@ class CookieClicker:
                         self.click_cookie()
                 self.plant_seed(x=tile[0], y=tile[1], seed_id=elderwort_id)
 
-        # self.get_farm_level()
-
         if not (self.plants["queenbeetLump"]["unlocked"] or self.plants["queenbeetLump"]["growing"]):
             if self.farm_level >= 7:
-                # wanted_aura = self.dragon_auras_lookup["Supreme Intellect"]["id"]
                 wanted_aura = self.final_wanted_aura
 
                 max_maturity = 0
@@ -2696,10 +2541,8 @@ class CookieClicker:
                     max_maturity = max(max_maturity, check_quadrant(q_coords))
 
                 if max_maturity >= self.plants["queenbeet"]["mature"] and not self.plants["queenbeetLump"]["unlocked"]:
-                    # self.switch_soil("woodchips")
                     self.desired_soil = "woodchips"
                 else:
-                    # self.switch_soil("fertilizer")
                     self.desired_soil = "fertilizer"
             else:
                 wanted_aura = self.final_wanted_aura
@@ -2708,17 +2551,12 @@ class CookieClicker:
 
         if self.dragon_complete:
             self.set_dragon_auras(dragon_aura=wanted_aura)
-            # try:
-            #     self.driver.execute_script(f"javascript:Game.SetDragonAura({wanted_aura},0);Game.ConfirmPrompt();")
-            # except JavascriptException:
-            #     self.click_cookie()
 
     def check_veil(self):
         try:
-            # self.driver.execute_script('javascript:return Game.Upgrades["Shimmering veil [on]"].canBuy();')
-            self.driver.find_element(by=By.XPATH, value='//div[@id="toggleUpgrades"]/div[@data-id="564"]')
-            self.is_veil_active = True
-        except NoSuchElementException:
+            self.is_veil_active = True if self.driver.execute_script(
+                f"javascript:return Game.Has('Shimmering veil [on]')") else False
+        except JavascriptException:
             self.is_veil_active = False
 
     def four_leaf_cookie(self):
@@ -2739,13 +2577,14 @@ class CookieClicker:
 
     def is_prestige_doubled(self):
         try:
-            prestige = self.driver.execute_script("javascript:return Game.prestige")
-            new_pres = self.driver.execute_script("javascript:return Game.HowMuchPrestige("
-                                                  "CookieMonsterData.Cache.RealCookiesEarned + "
-                                                  "Game.cookiesReset + "
-                                                  "CookieMonsterData.Cache.WrinklersTotal + "
-                                                  "(Game.HasUnlocked('Chocolate egg') && !Game.Has('Chocolate egg') ? "
-                                                  "CookieMonsterData.Cache.LastChoEgg : 0),)")
+            prestige, new_pres = self.driver.execute_script("javascript: return [Game.prestige, "
+                                                            "Game.HowMuchPrestige("
+                                                            "CookieMonsterData.Cache.RealCookiesEarned + "
+                                                            "Game.cookiesReset + "
+                                                            "CookieMonsterData.Cache.WrinklersTotal + "
+                                                            "(Game.HasUnlocked('Chocolate egg') && "
+                                                            "!Game.Has('Chocolate egg') ? "
+                                                            "CookieMonsterData.Cache.LastChoEgg : 0),)]")
             doubled = prestige * 2 < new_pres
             halfway = prestige * 1.5 < new_pres
         except JavascriptException:
@@ -2761,7 +2600,7 @@ class CookieClicker:
                   f'auras to Earth Shatterer and Reality Bending, sell all stock market goods, sell all buildings, '
                   f'buy chocolate egg.{Style.RESET_ALL}')
             if self.handle_ascension:
-                self.ascend
+                self.ascend()
 
     def ascend(self):
         if self.handle_ascension:
@@ -2781,9 +2620,9 @@ class CookieClicker:
                 "rigidel": "order"
             }
             try:
-                self.driver.execute_script(f"javascript:({temple}.slotHovered = 0;"
-                                           f"{temple}.dragging = {temple}.gods[{gods_lookup['skruuia']}];"
-                                           f"{temple}.dropGod(););")
+                self.driver.execute_script(f"javascript:{temple}.slotHovered = 0;"
+                                           f"{temple}.dragging = {temple}.gods['scorn'];"
+                                           f"{temple}.dropGod();")
                 print(f"{timestamp()}: Moved Skruuia to Diamond slot.")
                 self.driver.execute_script("Object.keys(Game.wrinklers).forEach((i) => {"
                                            "    if (Game.wrinklers[i].sucked > 0 && Game.wrinklers[i].type === 0) {"
@@ -2804,8 +2643,9 @@ class CookieClicker:
             for good_id in range(number_of_goods):
                 try:
                     good_name = self.driver.execute_script(f"javascript:return {goods_by_id}[{good_id}].name")
-                    stock_max = self.driver.execute_script(f"javascript:return {market}.getGoodMaxStock({market}."
-                                                           f"goodsById[{good_id}]);")
+                    # stock_max = self.driver.execute_script(f"javascript:return {market}.getGoodMaxStock({market}."
+                    #                                        f"goodsById[{good_id}]);")
+                    stock_max = f"{market}.getGoodMaxStock({market}.goodsById[{good_id}])"
 
                     self.driver.execute_script(f"javascript:{market}.sellGood({good_id}, {stock_max})")
                     print(f'{timestamp()}: {Fore.RED}Selling {good_name}.{Style.RESET_ALL}')
@@ -2842,6 +2682,7 @@ class CookieClicker:
                 input("Failed to ascend. Ascend manually.")
             self.dragon_level = 0
             self.dragon_upgrades_complete = False
+            self.dragon_complete = False
             self.handle_ascension = False
             input("Select Permanent Upgrade options and press Return to continue.")
             try:
@@ -2893,40 +2734,58 @@ class CookieClicker:
         def click_golden_cookie():
             js_code = "for (var sx in Game.shimmers) {" \
                       "var s = Game.shimmers[sx];" \
-                      "if (s.force == 'cookie storm drop') {s.pop};" \
-                      "if (s.type != 'golden' || s.life < Game.fps || !Game.Achievements['Early bird'].won) " \
+                      "if (s.force == 'cookie storm drop') {s.pop();}" \
+                      "else if (s.type != 'golden' || s.life < Game.fps || !Game.Achievements['Early bird'].won) " \
                       "{s.pop(); return;}" \
-                      "if ((s.life/Game.fps)<(s.dur-2) && (Game.Achievements['Fading luck'].won)) {s.pop(); return;}}"
+                      "else if ((s.life/Game.fps)<(s.dur-2) && (Game.Achievements['Fading luck'].won)) {" \
+                      "s.pop(); return;}}"
+
+            self.save_game(path=self.save_file)
 
             try:
                 self.driver.execute_script(f"javascript:{js_code}")
             except JavascriptException:
                 print(f"{timestamp()}: Failed to click golden cookie.")
 
-        shimmers = None
-        cookies = 0
-
         try:
             if (not self.is_veil_active or self.check_season()) and (self.get_ascension_mode() != 1 or
                                                                      self.check_achievements('True Neverclick')):
                 click = True
+                shimmers = None
                 while click:
-                    self.driver.execute_script("javascript:Game.ClickCookie();")
-                    self.cookie_click_errors = 0
-                    if self.attempt_1T_achievement:
-                        self.trillion_cookie_ascension()
                     try:
-                        shimmers = self.driver.execute_script("javascript:return Game.shimmers")
-                        cookies = self.driver.execute_script("javascript:return Game.cookies;")
+                        (shimmers,
+                         cookies,
+                         self.crafty_pixies) = self.driver.execute_script("javascript:Game.ClickCookie();"
+                                                                          "if (Game.TickerEffect) "
+                                                                          "{Game.tickerL.click()};"
+                                                                          "return [Game.shimmers, Game.cookies, "
+                                                                          "'Crafty pixies' in Game.buffs]")
+                        # print(f"{timestamp()}: Frenzy active: {'Frenzy' in self.game_buffs}; Craft pixies = {self.crafty_pixies}")
+                        self.cookie_click_errors = 0
                     except JavascriptException:
-                        print(f"{timestamp()}: Error checking shimmers")
+                        print(f"{timestamp()}: Error clicking cookie or checking shimmers.")
+                        self.cookie_click_errors += 1
+                        if self.cookie_click_errors >= 5:
+                            self.reload_cookieclicker(skip_save=self.time_next_save - time.time() > 30)
+                        continue
 
-                    if shimmers and (
-                            not self.attempt_1T_achievement or cookies <= 900000000000) and self.click_golden_cookies:
-                        click_golden_cookie()
+                    if shimmers and self.click_golden_cookies:
+                        if self.attempt_1T_achievement:
+                            if cookies <= 900000000000:
+                                click_golden_cookie()
+                            self.trillion_cookie_ascension()
+                        else:
+                            click_golden_cookie()
 
                     self.get_active_buffs()
-                    click = self.cf_active or self.df_active or self.cursed_finger_active
+                    if self.debuff_active:  # and not any([self.f_active, self.bs_active, self.dh_active, self.df_active
+                        #            , self.cf_active, self.ef_active, self.cursed_finger_active]):
+                        print(f"{timestamp()}: {Fore.LIGHTRED_EX}Reloading to avoid debuff golden cookies."
+                              f"{Style.RESET_ALL}")
+                        self.load_save()
+                        self.get_active_buffs()
+                    click = any([self.cf_active, self.df_active, self.cursed_finger_active])
 
                     if self.cursed_finger_active and self.cursed_finger_upgrades_next_time <= time.time():
                         self.cursed_finger_upgrades_next_time = time.time() + 60
@@ -2939,18 +2798,19 @@ class CookieClicker:
 
                     if click:
                         self.cast_spell(spell_to_cast="hand of fate", exhaust_magic=False)
+                    if self.crafty_pixies:
+                        self.buy_products()
                 if shimmers:
                     self.set_cps_multiplier()
-        except (JavascriptException, WebDriverException):
-            print(f"{timestamp()}: Error clicking cookie.")
+        except (Exception, WebDriverException) as e:
+            print(f"{timestamp()}: Unexpected error: {str(e)}.")
             self.cookie_click_errors += 1
             if self.cookie_click_errors >= 5:
                 self.reload_cookieclicker(skip_save=self.time_next_save - time.time() > 30)
 
     def save_game(self, path):
         try:
-            self.driver.execute_script("javascript:Game.ExportSave();")
-            save_code = self.driver.find_element(by=By.ID, value="textareaPrompt").text
+            save_code = self.driver.execute_script("javascript:return Game.WriteSave(1);")
             if save_code == "":
                 input("Save code corrupted. Copy save file before continuing.")
             with open(file=path, mode="w") as progress:
@@ -2959,34 +2819,37 @@ class CookieClicker:
             if path == self.save_file:
                 self.time_next_save = time.time() + 60
 
-            self.driver.execute_script("javascript:Game.ClosePrompt();")
         except (JavascriptException, InvalidSessionIdException):
             input("Save game failed. Waiting on user.")
 
     def load_save(self):
         if exists(self.save_file):
             try:
-                self.driver.execute_script("javascript:Game.ImportSave();")
+                # Read the save file
                 with open(file=self.save_file, mode="r") as progress:
                     load_save = progress.read()
-                    self.driver.find_element(by=By.ID, value="textareaPrompt").send_keys(load_save)
 
-                self.driver.find_element(by=By.ID, value="promptOption0").click()
-                try:
-                    upload_error_element = self.driver.find_element(by=By.ID, value="importError")
-                    upload_error = False if upload_error_element.text == "" else True
-                except NoSuchElementException:
-                    upload_error = False
+                # Wait for CookieMonster to load by checking for its presence
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: d.execute_script("return typeof Game.LoadSave == 'function';")
+                )
 
-                if upload_error:
-                    input("Try uploading manually. Press Return when done.")
-
-            except (NoSuchElementException, ElementClickInterceptedException, JavascriptException):
+                self.driver.execute_script(f'javascript:Game.LoadSave("{load_save}");')
+                print(f"{timestamp()}: Loaded save file.")
+            except (JavascriptException, TimeoutException) as e:
+                print(f"{timestamp()}: Error loading save: {str(e)}")
                 self.reload_cookieclicker(skip_save=True)
-                # self.driver.execute_script("javascript:Game.ClosePrompt();")
 
     def buy_products(self):
-        self.buy_upgrades()
+        def basic_cookie_click():
+            try:
+                self.driver.execute_script("javascript:Game.ClickCookie();")
+            except JavascriptException:
+                return
+
+        if not self.crafty_pixies:
+            self.buy_upgrades()
+
         blue_products = False
         if self.delay_product_purchase_until_after > time.time():
             print(
@@ -2999,18 +2862,16 @@ class CookieClicker:
             self.attempt_endless_cycle = False
 
         try:
-            cookies = self.driver.execute_script("javascript:return Game.cookies;")
-            cps = self.driver.execute_script("javascript:return Game.cookiesPs")
+            cookies, cps = self.driver.execute_script("javascript:return [Game.cookies, Game.cookiesPs]")
         except JavascriptException:
-            self.click_cookie()
+            basic_cookie_click()
             return
 
         if not self.attempt_1T_achievement or (cookies < 900000000000 and cps < 500000000):
-            # exit_time = time.time() + 3
             try:
                 min_price = self.driver.execute_script(f"javascript:return Game.cookies") * 10
             except JavascriptException:
-                self.click_cookie()
+                basic_cookie_click()
                 return
 
             while True:
@@ -3024,17 +2885,17 @@ class CookieClicker:
                 except JavascriptException:
                     buildings = []
                     print(f"{timestamp()}: Unable to retrieve building list")
-                    self.click_cookie()
+                    basic_cookie_click()
                 if self.attempt_endless_cycle:
                     try:
                         self.driver.execute_script(f"javascript:Game.storeBulkButton(4);")
                         products_available = [building["id"] for building in buildings if
                                               not building["locked"] and building["price"] <= cookies]
                     except (JavascriptException, NoSuchElementException):
-                        self.click_cookie()
+                        basic_cookie_click()
                         return
                     for product_id in products_available:
-                        self.click_cookie()
+                        basic_cookie_click()
                         # product_id = int(product.get_attribute("id").strip("product"))
                         try:
                             amount = int(
@@ -3049,10 +2910,9 @@ class CookieClicker:
                                 self.driver.execute_script(f"javascript:Game.storeBulkButton(3);"
                                                            f"Game.ObjectsById[{product_id}].buy(10);")
                         except JavascriptException:
-                            self.click_cookie()
+                            basic_cookie_click()
                             return
                 else:
-                    # self.get_bulk_number()
                     try:
                         self.driver.execute_script('javascript:check_obj = CookieMonsterData.Objects100;'
                                                    'for (var b in check_obj){'
@@ -3071,23 +2931,22 @@ class CookieClicker:
                     for building in buildings:
                         # if building['amount'] >= 700:
                         #     continue
-                        self.click_cookie()
+                        basic_cookie_click()
                         try:
                             cookies = self.driver.execute_script(f"javascript:return Game.cookies")
                         except JavascriptException:
                             cookies = 0
                         if building["price"] > cookies:
-                            self.click_cookie()
+                            basic_cookie_click()
                             continue
                         try:
-                            buy1 = self.driver.execute_script('javascript:return '
-                                                              f'CookieMonsterData.Objects1["{building["name"]}"]')
-                            buy10 = self.driver.execute_script(f'javascript:return '
-                                                               f'CookieMonsterData.Objects10["{building["name"]}"]')
-                            buy100 = self.driver.execute_script(f'javascript:return '
-                                                                f'CookieMonsterData.Objects100["{building["name"]}"]')
+                            cmd_objects = "CookieMonsterData.Objects"
+                            buy1, buy10, buy100 = self.driver.execute_script(f"javascript: return ["
+                                                                             f'{cmd_objects}1["{building["name"]}"],'
+                                                                             f'{cmd_objects}10["{building["name"]}"],'
+                                                                             f'{cmd_objects}100["{building["name"]}"]]')
                         except JavascriptException:
-                            self.click_cookie()
+                            basic_cookie_click()
                             return
                         try:
                             if buy100["colour"] in colors:
@@ -3121,10 +2980,12 @@ class CookieClicker:
                                     self.set_buildings_owned()
                                 blue_products = True if buy1["colour"] == "Blue" else blue_products
                         except JavascriptException:
-                            self.click_cookie()
+                            basic_cookie_click()
                             return
 
-                self.buy_upgrades()
+                if not self.crafty_pixies:
+                    self.buy_upgrades()
+
                 if min_price > cookies or (not blue_products and
                                            self.upgrades_to_buy) or (time.time() >
                                                                      self.next_garden_tick) or (time.time() >
@@ -3222,15 +3083,12 @@ class CookieClicker:
 
         self.upgrades_to_buy = []
 
-        try:
-            cursed_finger = self.driver.execute_script("javascript:return 'Cursed finger' in Game.buffs")
-
-            if cursed_finger:
-                print(f"{timestamp()}: {Fore.YELLOW}Skipping buy_products during cursed finger.{Style.RESET_ALL}")
-                self.delay_product_purchase_until_after = time.time() + 120
-        except JavascriptException:
-            self.click_cookie()
+        if self.attempt_1T_achievement:
             return
+
+        if self.cursed_finger_active:
+            print(f"{timestamp()}: {Fore.YELLOW}Skipping buy_products during cursed finger.{Style.RESET_ALL}")
+            self.delay_product_purchase_until_after = time.time() + 120
 
         try:
             upgrades_owned = self.driver.execute_script("javascript:return Game.UpgradesOwned")
@@ -3259,21 +3117,24 @@ class CookieClicker:
                 except JavascriptException:
                     self.click_cookie()
                     return
-                # print(f"{upgrade['name']}: {CookieMonsterData}")
-                price = float('inf')
                 if upgrade['name'] in self.overrides:
                     best_buy_overrides()
                     try:
-                        price = self.driver.execute_script("javascript:return "
-                                                           f"Game.UpgradesById[{upgrade['id']}].getPrice()")
-                        cookies = self.driver.execute_script("javascript:return Game.cookies")
-                        wrinklers_total = self.driver.execute_script("javascript:return "
-                                                                     "CookieMonsterData.Cache.WrinklersTotal")
+                        price, cookies, wrinklers_total = self.driver.execute_script(f"javascript: return ["
+                                                                                     f"Game.UpgradesById["
+                                                                                     f"{upgrade['id']}].getPrice(),"
+                                                                                     f"Game.cookies,"
+                                                                                     f"CookieMonsterData.Cache."
+                                                                                     f"WrinklersTotal]")
                     except JavascriptException:
                         self.click_cookie()
                         return
-                    cookie_monster_data["bonus"] = self.overrides[upgrade['name']] * cps
-                    if cookie_monster_data["bonus"] == 0:
+
+                    try:
+                        cookie_monster_data["bonus"] = self.overrides[upgrade['name']] * cps
+                    except TypeError:
+                        print(f"{timestamp()}: Error calculating bonus for {upgrade['name']}. CPS: {cps}.")
+                    if cookie_monster_data["bonus"] is None or cookie_monster_data["bonus"] == 0:
                         cookie_monster_data["bonus"] = cps * 0.01
                         print(f"{timestamp()}: Forced bonus for {upgrade['name']}")
                     if cps > 0:
@@ -3283,36 +3144,29 @@ class CookieClicker:
                         cookie_monster_data["pp"] = 0
                 if cookie_monster_data and cookie_monster_data["colour"] in {"Gray", "Blue"} and \
                         not avoid_buy(upgrade['id']) and \
-                        not upgrade["bought"] and cookie_monster_data["pp"] and cookie_monster_data["pp"] > 0:
-                    # print(f"{upgrade['name']} ({upgrade['id']}): {CookieMonsterData}")
-                    if not self.attempt_1T_achievement or (upgrade['id'] not in self.cursor_upgrades and
-                                                           upgrade['id'] not in self.clicking_upgrades and
-                                                           price < 100000000000
-                                                           and cps < 500000000):
+                        not upgrade["bought"]:
+                    if upgrade['id'] in self.cursor_upgrades or upgrade['id'] in self.clicking_upgrades or (
+                            cookie_monster_data["pp"] and cookie_monster_data["pp"] > 0):
                         self.upgrades_to_buy.append(upgrade)
-
-    # def check_elder_pledge(self):
-    #     elder_pledge_xpath = f'//div[@id="toggleUpgrades"]/div[@data-id="74"]/div[@class="pieTimer"]'
-    #     try:
-    #         self.driver.find_element(by=By.XPATH, value=elder_pledge_xpath)
-    #         self.elder_pledge_active = True
-    #     except NoSuchElementException:
-    #         self.elder_pledge_active = False
 
     def check_season(self):
         try:
-            return self.driver.execute_script('javascript:return Game.season')
+            self.season_active = self.driver.execute_script('javascript:return Game.season')
         except JavascriptException:
-            return ''
+            self.season_active = ''
+        return self.season_active
 
     def harvest_lumps(self):
         try:
-            age = int(self.driver.execute_script("javascript:return Date.now() - Game.lumpT"))
-            # lump_ripe_age = int(self.driver.execute_script("javascript:return Game.lumpRipeAge"))
-            lump_mature_age = int(self.driver.execute_script("javascript:return Game.lumpMatureAge"))
+            age, lump_mature_age = self.driver.execute_script("javascript:return [Date.now() - Game.lumpT,"
+                                                              "Game.lumpMatureAge]")
+            # age = int(self.driver.execute_script("javascript:return Date.now() - Game.lumpT"))
+            # lump_mature_age = int(self.driver.execute_script("javascript:return Game.lumpMatureAge"))
             if age >= lump_mature_age:
-                current_lumps = int(self.driver.execute_script("javascript:return Game.lumps"))
-                lump_type = int(self.driver.execute_script("javascript:return Game.lumpCurrentType"))
+                current_lumps, lump_type = self.driver.execute_script("javascript:return [Game.lumps, "
+                                                                      "Game.lumpCurrentType]")
+                # current_lumps = int(self.driver.execute_script("javascript:return Game.lumps"))
+                # lump_type = int(self.driver.execute_script("javascript:return Game.lumpCurrentType"))
                 if lump_type in (1, 3):
                     new_lump_goal = current_lumps + 2
                 elif lump_type == 2:
@@ -3577,35 +3431,44 @@ class CookieClicker:
 
         if not all_market_achievements_unlocked or True:
             try:
-                cursor_level = int(self.driver.execute_script("javascript:return Game.Objects['Cursor'].level"))
-                cursor_amount = int(self.driver.execute_script("javascript:return Game.Objects['Cursor'].amount"))
+                cursor_level, cursor_amount = self.driver.execute_script("javascript:return [Game.Objects['Cursor']."
+                                                                         "level, Game.Objects['Cursor'].amount]")
+                # cursor_level = int(self.driver.execute_script("javascript:return Game.Objects['Cursor'].level"))
+                # cursor_amount = int(self.driver.execute_script("javascript:return Game.Objects['Cursor'].amount"))
             except JavascriptException:
                 print(f"{timestamp()}: Failed to determine cursor level or amount.")
                 return
 
             try:
-                office_level = self.driver.execute_script(f"javascript:return {market}.officeLevel;")
-                max_office_level = self.driver.execute_script(f"javascript:return {market}.offices.length-1;")
+                office_level, max_office_level = self.driver.execute_script(f"javascript: return [{market}.officeLevel,"
+                                                                            f" {market}.offices.length-1]")
+                # office_level = self.driver.execute_script(f"javascript:return {market}.officeLevel;")
+                # max_office_level = self.driver.execute_script(f"javascript:return {market}.offices.length-1;")
                 if office_level < max_office_level:
                     cost = self.driver.execute_script(f"javascript:return {market}.offices[{office_level}].cost;")
-                    if cost and 720 >= cursor_amount >= cost[0] and cursor_level >= cost[1]:
+                    if cost and 820 >= cursor_amount >= cost[0] and cursor_level >= cost[1]:
                         self.driver.execute_script("javascript:l('bankOfficeUpgrade').click();")
             except JavascriptException:
                 print(f"{timestamp()}: Failed to upgrade office.")
 
             try:
-                next_tick = self.driver.execute_script(f'javascript:return ((Game.fps*{market}.secondsPerTick)-'
-                                                       f'{market}.tickT+30)/30')
-                if next_tick > 10:
-                    return
-                brokers = self.driver.execute_script(f"javascript:return {market}.brokers;")
-                max_brokers = self.driver.execute_script(f"javascript:return {market}.getMaxBrokers();")
+                (next_tick, brokers, max_brokers,
+                 broker_price, cookies) = self.driver.execute_script(f"javascript:return [((Game.fps*{market}."
+                                                                     f"secondsPerTick)-{market}.tickT+30)/30,"
+                                                                     f"{market}.brokers, "
+                                                                     f"{market}.getMaxBrokers(), "
+                                                                     f"{market}.getBrokerPrice() * 100, "
+                                                                     f"Game.cookies];")
                 if brokers < max_brokers:
-                    broker_price = self.driver.execute_script(f"javascript:return {market}.getBrokerPrice();") * 100
-                    cookies = self.driver.execute_script(f"javascript:return Game.cookies;")
                     if broker_price < cookies:
                         self.driver.execute_script("javascript:l('bankBrokersBuy').click();")
+                        print(f"{timestamp()}: Bought a broker.")
+                    # else:
+                    #     print(f"{timestamp()}: Broker price: {broker_price / 100}; Cookies: {cookies}.")
                 overhead = 0.2 * math.pow(.95, brokers)
+
+                if next_tick > 10:
+                    return
             except (JavascriptException, NoSuchElementException, ElementClickInterceptedException):
                 print(f"{timestamp()}: Failed to buy broker.")
                 overhead = 0.2
@@ -3634,14 +3497,21 @@ class CookieClicker:
                     if self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].active &&"
                                                   f"!{goods_by_id}[{i}].hidden"):
                         good_id = i
-                        good_name = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].name")
-                        good_symbol = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].symbol")
-                        stock_price = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].val")
-                        stock_shares = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].stock")
+                        good_data = self.driver.execute_script(f"javascript:return [{goods_by_id}[{i}].name, "
+                                                               f"{goods_by_id}[{i}].symbol, "
+                                                               f"{goods_by_id}[{i}].val, "
+                                                               f"{goods_by_id}[{i}].stock, "
+                                                               f"{market}.getGoodMaxStock({market}.goodsById["
+                                                               f"{good_id}])]")
+                        (good_name, good_symbol, stock_price, stock_shares, stock_max) = good_data
+                        # good_name = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].name")
+                        # good_symbol = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].symbol")
+                        # stock_price = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].val")
+                        # stock_shares = self.driver.execute_script(f"javascript:return {goods_by_id}[{i}].stock")
                         buy_price = goods_price_list[bank_level][good_id][0]
                         sell_price = goods_price_list[bank_level][good_id][1]
-                        stock_max = self.driver.execute_script(f"javascript:return {market}.getGoodMaxStock({market}."
-                                                               f"goodsById[{good_id}]);")
+                        # stock_max = self.driver.execute_script(f"javascript:return {market}.getGoodMaxStock({market}."
+                        #                                        f"goodsById[{good_id}]);")
 
                         if (stock_price <= buy_price and stock_shares != stock_max) or (
                                 not market_achievements['Buy buy buy'] and
@@ -3690,8 +3560,11 @@ class CookieClicker:
             if crumbly_egg_unlocked:
                 self.dragon_auras_lookup = self.driver.execute_script("javascript:return Game.dragonAurasBN")
             if crumbly_egg_unlocked and not self.dragon_complete:
-                self.dragon_level = int(self.driver.execute_script("javascript:return Game.dragonLevel;"))
-                self.max_dragon_level = int(self.driver.execute_script("javascript:return Game.dragonLevels.length-1;"))
+                dragon_info = self.driver.execute_script("javascript:return [Game.dragonLevel, "
+                                                         "Game.dragonLevels.length-1];")
+                (self.dragon_level, self.max_dragon_level) = dragon_info
+                # self.dragon_level = int(self.driver.execute_script("javascript:return Game.dragonLevel;"))
+                # self.max_dragon_level = int(self.driver.execute_script("javascript:return Game.dragonLevels.length-1;"))
                 self.freeze_check()
                 wanted_aura = self.dragon_auras_lookup["No aura"]["id"]
                 if self.dragon_level >= 5:
@@ -3913,8 +3786,10 @@ class CookieClicker:
         dragon_aura2 = None
         if self.dragon_level >= 5:
             try:
-                dragon_aura = int(self.driver.execute_script("javascript:return Game.dragonAura;"))
-                dragon_aura2 = int(self.driver.execute_script("javascript:return Game.dragonAura2;"))
+                dragon_aura, dragon_aura2 = self.driver.execute_script("javascript:return [Game.dragonAura, "
+                                                                       "Game.dragonAura2];")
+                # dragon_aura = int(self.driver.execute_script("javascript:return Game.dragonAura;"))
+                # dragon_aura2 = int(self.driver.execute_script("javascript:return Game.dragonAura2;"))
             except JavascriptException:
                 dragon_aura = None
                 dragon_aura2 = None
@@ -3964,9 +3839,9 @@ class CookieClicker:
         jade = 2
 
         try:
-            gods = self.driver.execute_script(f"javascript:return {temple}.gods")
-            self.swaps_left = self.driver.execute_script(f"javascript:return {temple}.swaps")
-            slots = self.driver.execute_script(f"javascript:return {temple}.slot")
+            gods, self.swaps_left, slots = self.driver.execute_script(f"javascript:return [{temple}.gods, "
+                                                                      f"{temple}.swaps, "
+                                                                      f"{temple}.slot]")
         except JavascriptException:
             self.click_cookie()
             return
@@ -4047,8 +3922,8 @@ class CookieClicker:
 
             if perform_swap:
                 try:
-                    current_slot_id = self.driver.execute_script(f"javascript:return "
-                                                                 f"{temple}.gods['{gods_lookup['cyclius']}'].slot")
+                    current_slot_id = self.driver.execute_script(f"javascript:return Number({temple}.gods["
+                                                                 f"'{gods_lookup['cyclius']}'].slot)")
                     if new_temple_slot != current_slot_id:
                         if new_temple_slot != -1:
                             print(f"{timestamp()}: Moving Cyclius ({gods_lookup['cyclius']}) to slot "
@@ -4080,8 +3955,8 @@ class CookieClicker:
                     return
             elif move_secondary:
                 try:
-                    current_slot_id = self.driver.execute_script(f"javascript:return "
-                                                                 f"{temple}.gods['{gods_lookup[move_secondary]}'].slot")
+                    current_slot_id = self.driver.execute_script(f"javascript:return Number({temple}.gods["
+                                                                 f"'{gods_lookup[move_secondary]}'].slot)")
                     if new_temple_slot != current_slot_id:
                         print(f"{timestamp()}: Moving {move_secondary} ({gods_lookup[move_secondary]}) to slot "
                               f"{new_temple_slot}. Previous slot {current_slot_id}")
@@ -4105,19 +3980,28 @@ class CookieClicker:
             slot_id = 0
             for god in static_gods:
                 try:
-                    god_slot_id = self.driver.execute_script(f"javascript:return {temple}.gods['{gods_lookup[god]}']."
-                                                             f"slot")
+                    (god_slot_id,
+                     self.swaps_left,
+                     skruuia_slot) = self.driver.execute_script(f"javascript:return [Number({temple}.gods["
+                                                                f"'{gods_lookup[god]}'].slot), "
+                                                                f"{temple}.swaps, Number({temple}.gods["
+                                                                f"'{gods_lookup['skruuia']}'].slot)]")
                     if god_slot_id != slot_id:
                         if god == 'godzamok':
                             self.save_game(path="./before_godzamok.txt")
+                        elif self.swaps_left < 3 and (self.time_last_wrinkler_popped + 120 >= time.time()
+                                                      or skruuia_slot == -1):
+                            return
                         self.driver.execute_script(f"javascript:{temple}.slotHovered = {slot_id};"
                                                    f"{temple}.dragging = {temple}.gods['{gods_lookup[god]}'];"
                                                    f"{temple}.dropGod();")
+                        print(f"{timestamp()}: Moved {god} from {god_slot_id} to slot {slot_id}.")
                         if god == 'godzamok':
                             self.godzamok_click_bonus()
                             self.driver.execute_script(f"javascript:{temple}.slotHovered = {slot_id};"
                                                        f"{temple}.dragging = {temple}.gods"
                                                        f"['{gods_lookup[default_god1]}'];{temple}.dropGod();")
+                            print(f"{timestamp()}: Moved {default_god1} to slot {slot_id}.")
                 except JavascriptException:
                     self.click_cookie()
                 self.click_cookie()
@@ -4127,92 +4011,127 @@ class CookieClicker:
         def equation(t, m, l):
             if t < 0:
                 return float('inf')
-            return 4 + np.power(t, 0.6) + 15 * np.log(1 + (t + 10 * (l - 1)) / 15) - m
+            return np.floor(4 + np.power(t, 0.6) + 15 * np.log(1 + (t + 10 * (l - 1)) / 15)) - m
 
-        buildings_to_sell = {'Wizard tower', # Wizard tower is first due to additional time calculating sell quantity
-                             'Bank', 'Factory', 'Antimatter condenser', 'Alchemy lab', 'Mine', 'Portal',
-                             'Idleverse', 'Farm', 'Shipment', 'Temple', 'Prism', 'Cortex baker'}
+        buildings_to_sell = [
+            {'name': 'Wizard tower', 'id': 7, 'buy_back_quantity': 0},
+            {'name': 'Bank', 'id': 5, 'buy_back_quantity': 0},
+            {'name': 'Factory', 'id': 4, 'buy_back_quantity': 0},
+            {'name': 'Antimatter condenser', 'id': 12, 'buy_back_quantity': 0},
+            {'name': 'Alchemy lab', 'id': 9, 'buy_back_quantity': 0},
+            {'name': 'Mine', 'id': 3, 'buy_back_quantity': 0},
+            {'name': 'Portal', 'id': 10, 'buy_back_quantity': 0},
+            {'name': 'Idleverse', 'id': 17, 'buy_back_quantity': 0},
+            {'name': 'Farm', 'id': 2, 'buy_back_quantity': 0},
+            {'name': 'Shipment', 'id': 8, 'buy_back_quantity': 0},
+            {'name': 'Temple', 'id': 6, 'buy_back_quantity': 0},
+            {'name': 'Prism', 'id': 13, 'buy_back_quantity': 0},
+            {'name': 'Cortex baker', 'id': 18, 'buy_back_quantity': 0},
+            {'name': 'Chancemaker', 'id': 14, 'buy_back_quantity': 0},
+            {'name': 'Time machine', 'id': 11, 'buy_back_quantity': 0}
+        ]
 
-        try:
-            cookies = self.driver.execute_script("javascript:return Game.cookies;")
-            lumps = self.driver.execute_script("javascript:return Game.lumps")
-            sugar_frenzy = self.driver.execute_script("javascript:return Game.Upgrades['Sugar frenzy'].unlocked && "
-                                                      "!Game.Upgrades['Sugar frenzy'].bought")
-            # self.driver.execute_script(f"javascript:Game.UpgradesById[452].click(event);")
-        except JavascriptException:
+        def execute_js(script, default=None):
+            try:
+                return self.driver.execute_script(f"javascript:return {script};")
+            except JavascriptException:
+                print(f"Error collecting data for Godzamok bonus.")
+                return default
+
+        cb_data = execute_js("[Game.cookies, Game.lumps, Game.Upgrades['Sugar frenzy'].unlocked && "
+                             "!Game.Upgrades['Sugar frenzy'].bought, "
+                             "Game.ObjectsById.map(({id, name, amount, level, price, locked}) => "
+                             "({id, name, amount, level, price, locked}))]")
+
+        if cb_data:
+            (cookies, lumps, sugar_frenzy, buildings) = cb_data
+        else:
             cookies = 'Unknown'
             lumps = 100
             sugar_frenzy = False
-
-        try:
-            buildings = self.driver.execute_script("javascript:return Game.ObjectsById.map(({id, name, amount, level, "
-                                                   "price, locked}) => ({id, name, amount, level, price, locked}))")
-        except JavascriptException:
             buildings = []
-            print(f"{timestamp()}: Unable to retrieve building list")
-            self.click_cookie()
+
+        # cookies = execute_js("Game.cookies", 'Unknown')
+        # lumps = execute_js("Game.lumps", 100)
+        # sugar_frenzy = execute_js("Game.Upgrades['Sugar frenzy'].unlocked && "
+        #                           "!Game.Upgrades['Sugar frenzy'].bought", False)
+        #
+        # buildings = execute_js(
+        #     "Game.ObjectsById.map(({id, name, amount, level, price, locked}) => "
+        #     "({id, name, amount, level, price, locked}))",
+        #     []
+        # )
 
         if self.sugar_frenzy_spend:
             if sugar_frenzy and lumps > 100:
-                try:
-                    self.driver.execute_script("javascript:Game.Upgrades['Sugar frenzy'].buy()")
+                if execute_js("Game.Upgrades['Sugar frenzy'].buy()") is not None:
                     print(f"{timestamp()}: {Fore.GREEN}Activated sugar frenzy.{Style.RESET_ALL}")
-                except JavascriptException:
+                else:
                     print(f"{timestamp()}: {Fore.RED}Failed to activate sugar frenzy.{Style.RESET_ALL}")
             elif lumps <= 100:
                 print(f"{timestamp()}: {Fore.YELLOW}Need more than 100 lumps for sugar frenzy.{Style.RESET_ALL}")
             else:
                 print(f"{timestamp()}: {Fore.YELLOW}Sugar frenzy is unavailable.{Style.RESET_ALL}")
         else:
-            print(f"{timestamp()}: {Fore.YELLOW}Waiting until 50% of the way toward doubling prestige."
-                  f"{Style.RESET_ALL}")
+            print(
+                f"{timestamp()}: {Fore.YELLOW}Waiting until 50% of the way toward doubling prestige.{Style.RESET_ALL}")
 
         print(f"{timestamp()}: {Fore.GREEN}Cookies in bank: {humanize.scientific(cookies, precision=5)}."
               f"{Style.RESET_ALL}")
-        print(f"{timestamp()}: {Fore.GREEN}Switching dragon aura to Earth Shatterer & Reality Bending."
-              f"{Style.RESET_ALL}")
-        # self.set_dragon_auras(dragon_aura=self.dragon_auras_lookup["Earth Shatterer"]["id"],
-        #                       dragon_aura2=self.dragon_auras_lookup["Reality Bending"]["id"])
-        self.set_dragon_auras(dragon_aura=self.dragon_auras_lookup["Earth Shatterer"]["id"])
 
-        for building in buildings:
-            try:
-                self.driver.execute_script("javascript:Game.ClickCookie();")
-            except JavascriptException:
-                print(f"{timestamp()}: Error clicking cookie.")
-            if not building["locked"] and building["name"] in buildings_to_sell:
-                try:
-                    if building["name"] == 'Temple':
-                        sell_quantity = building['amount'] - 1
-                    elif building["name"] == 'Wizard tower':
-                        m = self.driver.execute_script("javascript:return Game.Objects['Wizard tower'].minigame.magic")
-                        l = building["level"]
-                        initial_guess = 21
+        for building in buildings_to_sell:
+            building_id = building['id']
+            execute_js("Game.ClickCookie()")
+            if not buildings[building_id]["locked"]:
+                if building["name"] == 'Temple':
+                    sell_quantity = buildings[building_id]['amount'] - 1
+                elif building["name"] == 'Wizard tower':
+                    m = execute_js("Game.Objects['Wizard tower'].minigame.magic", 0)
+                    l = buildings[building_id]["level"]
+                    min_magic = np.floor(4 + np.power(1, 0.6) + 15 * np.log(1 + (1 + 10 * (l - 1)) / 15))
+                    if m >= min_magic:
+                        initial_guess = np.array([1], dtype=float)
                         t_solution = fsolve(equation, initial_guess, args=(m, l))
-                        t_solution = max(math.ceil(t_solution[0]), 0)
-                        if t_solution == 0:
-                            sell_quantity = 0
-                        else:
-                            sell_quantity = building['amount'] - t_solution
+                        t_solution = max(int(np.ceil(t_solution[0])), 1)
                     else:
-                        sell_quantity = building['amount']
-                    buy_back_quantity = max(sell_quantity - 100, 0)
-                    self.driver.execute_script(f"javascript:"
-                                               f"Game.ObjectsById[{building['id']}].sell({sell_quantity})")
-                    print(f"{timestamp()}: {Fore.LIGHTRED_EX}Selling {sell_quantity} {building['name']}."
+                        # Magic is below minimum threshold for current level. Sell all but one Wizard tower
+                        t_solution = 1
+                        print(f"{timestamp()}: Selling all but one Wizard tower.")
+                    sell_quantity = max(buildings[building_id]['amount'] - t_solution, 0)
+                    # Wizard tower must be first item in array. This waits to switch the aura until after calculations.
+                    print(f"{timestamp()}: {Fore.GREEN}Switching dragon aura to Earth Shatterer."
                           f"{Style.RESET_ALL}")
-                    if building["name"] == "Wizard tower":
-                        self.cast_spell(spell_to_cast='summon crafty pixies')
-                    if buy_back_quantity > 0:
-                        self.driver.execute_script(f"javascript:"
-                                                   f"Game.ObjectsById[{building['id']}].buy({buy_back_quantity})")
-                        print(f"{timestamp()}: {Fore.LIGHTGREEN_EX}Buying back {buy_back_quantity} {building['name']}."
-                              f"{Style.RESET_ALL}")
-                except JavascriptException:
-                    self.click_cookie()
+                    self.set_dragon_auras(dragon_aura=self.dragon_auras_lookup["Earth Shatterer"]["id"])
+
+                else:
+                    sell_quantity = buildings[building_id]['amount']
+
+                building['buy_back_quantity'] = max(sell_quantity, 0)
+
+                execute_js(f"Game.ObjectsById[{building_id}].sell({sell_quantity})")
+                print(f"{timestamp()}: {Fore.LIGHTRED_EX}Selling {sell_quantity} {building['name']}."
+                      f"{Style.RESET_ALL}")
 
         print(f"{timestamp()}: {Fore.GREEN}Switching aura back to default.{Style.RESET_ALL}")
         self.set_dragon_auras(dragon_aura=self.final_wanted_aura, dragon_aura2=self.final_wanted_aura2)
+
+        self.cast_spell(spell_to_cast='summon crafty pixies')
+
+        execute_js("Game.Objects['You'].buy(2)")
+        print(f"{timestamp()}: {Fore.LIGHTGREEN_EX}Buying back 2 You.{Style.RESET_ALL}")
+
+        for building in buildings_to_sell[::-1]:
+            execute_js("Game.ClickCookie()")
+
+            building_id = building['id']
+            if buildings[building_id]["locked"]:
+                continue
+
+            if building['buy_back_quantity'] > 0:
+                execute_js(f"Game.ObjectsById[{building_id}].buy({building['buy_back_quantity']})")
+                print(
+                    f"{timestamp()}: {Fore.LIGHTGREEN_EX}Buying back {building['buy_back_quantity']} "
+                    f"{building['name']}.{Style.RESET_ALL}")
 
     def open_mini_games(self):
         minigame_rows = [2, 5, 6, 7]
@@ -4220,9 +4139,11 @@ class CookieClicker:
         for minigame_row in minigame_rows:
             self.click_cookie()
             try:
-                self.driver.find_element(by=By.XPATH, value=f'//div[@id="row{minigame_row}" and @class="row enabled"]')
-                self.driver.execute_script(f"javascript:Game.ObjectsById[{minigame_row}].switchMinigame(-1);")
-            except (JavascriptException, NoSuchElementException, WebDriverException):
+                building = f"Game.ObjectsById[{minigame_row}]"
+                self.driver.execute_script(
+                    f"javascript:if (Game.isMinigameReady({building}) && !{building}.onMinigame) "
+                    f"{building}.switchMinigame(-1);")
+            except JavascriptException:
                 self.click_cookie()
                 return
 
@@ -4231,11 +4152,46 @@ class CookieClicker:
         self.driver.quit()
 
     def pop_fattest_wrinkler(self):
+        temple = "Game.Objects['Temple'].minigame"
+        mokalsium = "mother"
+        skruuia = "scorn"
+
         try:
-            js = 'Game.wrinklers[CookieMonsterData.Cache.WrinklersFattest[1]].hp = 0'
-            # fattest_id = self.driver.execute_script('javascript:return CookieMonsterData.Cache.WrinklersFattest[1]')
-            self.driver.execute_script(f'javascript:{js}')
-            # self.driver.find_element(by=By.ID, value="PopFattestWrinklerButton").click()
+            (self.swaps_left,
+             skruuia_slot,
+             cookies_before) = self.driver.execute_script(f"javascript:return [{temple}.swaps, "
+                                                          f"Number({temple}.gods['{skruuia}'].slot),"
+                                                          f"Game.cookies]")
+        except JavascriptException:
+            self.click_cookie()
+            return
+
+        move_gods = self.swaps_left == 3 and skruuia_slot != 0
+
+        if move_gods:
+            try:
+                self.driver.execute_script(f"javascript:{temple}.slotHovered = 0;"
+                                           f"{temple}.dragging = {temple}.gods['{skruuia}'];"
+                                           f"{temple}.dropGod();")
+                print(f"{timestamp()}: Moved Skruuia to diamond slot.")
+            except JavascriptException:
+                self.click_cookie()
+                return
+        else:
+            return
+
+        try:
+            # js = 'Game.wrinklers[CookieMonsterData.Cache.WrinklersFattest[1]].hp = 0; return Game.cookies;'
+            js = ('Object.keys(Game.wrinklers).forEach((i) => {'
+                  'if (Game.wrinklers[i].sucked > 0 && Game.wrinklers[i].type === 0) {'
+                  'Game.wrinklers[i].hp = 0;'
+                  '}'
+                  '}); return Game.cookies')
+            cookies_after = self.driver.execute_script(f'javascript:{js}')
+
+            print(f"{timestamp()}: {Fore.LIGHTCYAN_EX}Cookies before popping all wrinklers: "
+                  f"{humanize.scientific(cookies_before, precision=5)}. Cookies after popping all wrinklers: "
+                  f"{humanize.scientific(cookies_after, precision=5)}.{Style.RESET_ALL}")
             self.time_last_wrinkler_popped = time.time()
         except JavascriptException:
             self.click_cookie()
@@ -4247,8 +4203,8 @@ class CookieClicker:
         max_cps_per_lump_achv = 0
         sum_cps = 0
         try:
-            cps_by_type = self.driver.execute_script("javascript:return Game.cookiesPsByType")
-            lumps = self.driver.execute_script("javascript:return Game.lumps")
+            cps_by_type, lumps = self.driver.execute_script("javascript:return [Game.cookiesPsByType, Game.lumps]")
+            # lumps = self.driver.execute_script("javascript:return Game.lumps")
         except JavascriptException:
             self.click_cookie()
             return
