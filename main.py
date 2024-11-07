@@ -5,17 +5,16 @@ import psutil
 from colorama import init as colorama_init
 from colorama import Fore, Style
 
-# PROGRESS_FILE = os.environ["PROGRESS_FILE"]
 from dotenv import load_dotenv
 load_dotenv()
 colorama_init()
 PROGRESS_FILE = getenv("PROGRESS_FILE")
 is_game_on = True
 save_and_exit = False
-NUMBER_OF_HOURS_TO_RUN = 168
+NUMBER_OF_HOURS_TO_RUN = 24 * 7
 HOURS_BETWEEN_WRINKLER_POPS = 24
 # HOURS_BETWEEN_RELOADS = 4  # This helps with the lag issue due to memory usage on Chrome
-MIN_AVAILABLE_MEMORY_GB = 2.375
+MIN_AVAILABLE_MEMORY_GB = 1.75
 
 building_level_goal = "cps"
 handle_ascension = False
@@ -71,6 +70,17 @@ while is_game_on and not save_and_exit:
 
     # cookie_clicker.cast_spell(spell_to_cast="resurrect abomination", exhaust_magic=False)
 
+    cookie_clicker.set_cps_multiplier()
+    if cookie_clicker.cpsMult > cookie_clicker.cps_threshold or cookie_clicker.cpsMult <= 1:
+        if cookie_clicker.farming_goal == 'lumps':
+            cookie_clicker.garden_maintenance(plant_name='bakeberry')
+        elif cookie_clicker.farming_goal == 'cookies':
+            cookie_clicker.increase_golden_cookie_frequency()
+    cookie_clicker.get_plant_details()
+    if cookie_clicker.attempt_to_unlock_seeds and cookie_clicker.cpsMult <= 1:
+        cookie_clicker.unlock_seeds()
+    cookie_clicker.switch_soil()
+
     if not prompt_for_save:
         cookie_clicker.click_cookie()
 
@@ -94,19 +104,6 @@ while is_game_on and not save_and_exit:
         response = input("Save game and exit (Yes/No)? ")
         if response == "Yes":
             save_and_exit = True
-        else:
-            save_and_exit = False
+            break
 
-    cookie_clicker.set_cps_multiplier()
-    if cookie_clicker.cpsMult > cookie_clicker.cps_threshold or cookie_clicker.cpsMult <= 1:
-        if cookie_clicker.farming_goal == 'lumps':
-            cookie_clicker.garden_maintenance(plant_name='bakeberry')
-        elif cookie_clicker.farming_goal == 'cookies':
-            cookie_clicker.increase_golden_cookie_frequency()
-    cookie_clicker.get_plant_details()
-    if cookie_clicker.attempt_to_unlock_seeds and cookie_clicker.cpsMult <= 1:
-        cookie_clicker.unlock_seeds()
-    cookie_clicker.switch_soil()
-
-cookie_clicker.save_game(path=PROGRESS_FILE)
-cookie_clicker.quit_game()
+cookie_clicker.quit_game(click_cookie=not save_and_exit)
