@@ -212,6 +212,10 @@ class CookieClicker:
             print(f"{timestamp()}: Reloading.")
             self.reload_cookieclicker(skip_save=True)
 
+    def assign_permanent_slot(self, slot, options):
+        if self.exec_js(f"return !Game.UpgradesById[264+{slot}].bought;"):
+            return
+
     def check_achievements(self, achievement):
         script = f"return Game.Achievements['{achievement}'].won;"
         if achievement != 'True Neverclick':
@@ -1835,215 +1839,577 @@ class CookieClicker:
          self.debuff_active) = self.exec_js(script=script, default_return=[False] * 8)
 
     def cast_spell(self, spell_to_cast, exhaust_magic=False):
-        game = 'Game.Objects["Wizard tower"].minigame'
-        spell = f'{game}.spells["{spell_to_cast}"]'
-        fthof = f'{game}.spells["hand of fate"]'
-        gfd = f'{game}.spellsById[6]'  # Gambler's Fever Dream
-        scp = f'{game}.spellsById[5]'  # Summon Crafty Pixies
-        gfd_forecasts = {
-            "green_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate',
-            "green_fthof_cf": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Click Frenzy)',
-            "green_fthof_bs": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Building Special)',
-            "green_fthof_frenzy": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                                  '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Frenzy)',
-            "good_fthof_lucky": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                                '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Lucky)',
-            "good_fthof_blab": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Blab)',
-            "ef_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
-                        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Elder Frenzy)',
-            "red_fthof_lump": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
-                              '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Free Sugar Lump'
+        """Cast spells optimally for maximum combo potential"""
+        grimoire = "Game.Objects['Wizard tower'].minigame"
+
+        # Define buff categories
+        CLICK_BUFFS = {'Click Frenzy', 'Dragonflight', 'Elder Frenzy'}
+        STACKING_BUFFS = {
+            'Click Frenzy', 'Dragonflight', 'Elder Frenzy', 'Building Special',
+            'Dragon Harvest', 'Frenzy',  # None stack with themselves
+            'High-five', 'Congregation', 'Luxuriant harvest', 'Ore vein',
+            'Oiled-up', 'Juicy profits', 'Fervent adoration', 'Manabloom',
+            'Delicious lifeforms', 'Breakthrough', 'Righteous cataclysm',
+            'Golden ages', 'Extra cycles', 'Solar flare', 'Winning streak',
+            'Macrocosm', 'Refactoring', 'Cosmic nursery', 'Brainstorm',
+            'Deduplication'
         }
-        buffer = 21
 
-        (magic,
-         magic_max,
-         spell_cost,
-         current_lumps,
-         lump_refill,
-         fthof_cost,
-         gfd_cost) = self.exec_js(script=f'return [{game}.magic, {game}.magicM, {game}.getSpellCost({spell}), '
-                                         f'Game.lumps, Game.lumpRefill, {game}.getSpellCost({fthof}), '
-                                         f'{game}.getSpellCost({gfd})];', default_return=[None] * 7)
+        try:
+            # Get all relevant state including next spell forecasts with proper season index and backfire
+            state = self.exec_js(script=f"""
+                return {{
+                    magic: {grimoire}.magic,
+                    maxMagic: {grimoire}.magicM,
+                    lumps: Game.lumps,
+                    lumpRefill: Game.lumpRefill,
+                    buffs: Object.values(Game.buffs).map(b => ({{
+                        name: b.name,
+                        time: b.time
+                    }})),
+                    spellCosts: {{
+                        fthof: {grimoire}.getSpellCost({grimoire}.spellsById[1]),
+                        gfd: {grimoire}.getSpellCost({grimoire}.spellsById[6]),
+                        scp: {grimoire}.getSpellCost({grimoire}.spellsById[5])
+                    }},
+                    forecasts: {{
+                        fthof1: FortuneCookie.FateChecker(
+                            {grimoire}.spellsCastTotal,
+                            ((Game.season == "valentines" || Game.season == "easter") ? 1 : 0),
+                            {grimoire}.getFailChance({grimoire}.spellsById[1]) + 0.15 * FortuneCookie.getSimGCs(),
+                            false
+                        ),
+                        fthof2: FortuneCookie.FateChecker(
+                            {grimoire}.spellsCastTotal + 1,
+                            ((Game.season == "valentines" || Game.season == "easter") ? 1 : 0),
+                            {grimoire}.getFailChance({grimoire}.spellsById[1]) + 0.15 * FortuneCookie.getSimGCs(),
+                            false
+                        ),
+                        gfd: FortuneCookie.spellForecast({grimoire}.spellsById[6])
+                    }}
+                }}
+            """)
 
-        if any(var is None for var in (magic, magic_max, spell_cost, current_lumps, fthof_cost, gfd_cost)):
-            return
-
-        fthof_half_cost = fthof_cost / 2
-        gfd_cast_fthof_cost = fthof_half_cost + gfd_cost
-
-        if spell_to_cast == "gambler's fever dream":
-            if magic < (spell_cost + fthof_half_cost) * 2:
-                self.click_golden_cookies = False
-                print(f'{timestamp()}: Waiting for enough magic to get Four-leaf cookie')
+            if not state:
                 return
 
-            for _ in range(2):
-                self.click_cookie()
-                self.exec_js(script=f"{game}.castSpell({spell});")
+            # Handle specific spells first
+            if spell_to_cast == "summon crafty pixies":
+                if state['magic'] >= state['spellCosts']['scp']:
+                    scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
+                                   '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
+                    scp_result = self.exec_js(script=f"return FortuneCookie.spellForecast({grimoire}.spellsById[5]);",
+                                              default_return="Failed")
+                    if scp_result and scp_result.startswith(scp_success):
+                        print(f"{timestamp()}: Casting Summon Crafty Pixies")
+                        self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[5])")
+                    else:
+                        print(f"{timestamp()}: Spell would backfire; not casting.")
+                return
 
-            self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
-            print(f"{timestamp()}: Spending one lump to refill Grimoire.")
-            self.exec_js(script=f"{game}.castSpell({fthof});")
-            while not self.check_achievements('Four-leaf cookie'):
-                pass
-            self.click_golden_cookies = True
+            elif spell_to_cast == "gambler's fever dream":
+                # Check if we can attempt Four-leaf cookie achievement
+                fthof_cost = state['spellCosts']['fthof']
+                gfd_cost = state['spellCosts']['gfd']
+                half_fthof = fthof_cost / 2
 
-            return
+                # Need enough magic for GFD + half FTHOF cost and enough lumps for refill
+                if (state['magic'] >= (gfd_cost + half_fthof) and
+                        state['lumps'] > 101 and not state['lumpRefill']):
 
-        spells_cast = self.exec_js(script=f"return {game}.spellsCastTotal;")
+                    # Look for good outcomes in next few casts
+                    good_outcomes = 0
+                    for i in range(1, 4):  # Check next 3 potential casts
+                        forecast = self.exec_js(
+                            script=f"""
+                            return FortuneCookie.FateChecker(
+                                {grimoire}.spellsCastTotal + {i},
+                                ((Game.season == "valentines" || Game.season == "easter") ? 1 : 0),
+                                {grimoire}.getFailChance({grimoire}.spellsById[1]) + 0.15 * FortuneCookie.getSimGCs(),
+                                false
+                            );
+                            """
+                        )
+                        if any(buff in forecast for buff in
+                               ['Click Frenzy', 'Building Special', 'Elder Frenzy', 'Dragon Harvest']):
+                            good_outcomes += 1
 
-        if spells_cast == self.spell_count_four_leaf_cookie or spells_cast is None:
-            return
+                    # If we see multiple good outcomes, try for Four-leaf cookie
+                    if good_outcomes >= 2:
+                        print(f"{timestamp()}: Attempting Four-leaf cookie achievement")
+                        # Cast GFD twice
+                        self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                        self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                        # Refill magic
+                        self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
+                        print(f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
+                        # Cast FTHOF
+                        self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                        # Wait for achievement
+                        while not self.check_achievements('Four-leaf cookie'):
+                            pass
+                        return
+                return
 
-        if magic >= gfd_cast_fthof_cost:
-            gfd_result = self.exec_js(script=f"return FortuneCookie.spellForecast({gfd});",
-                                      default_return="Failed to get Gambler's Fever Dream result")
+            # Parse GFD forecast - skip header line and get next two spell predictions
+            gfd_forecast = state['forecasts']['gfd']
+            gfd_lines = gfd_forecast.split('<br/>')
+            # Skip the "Forecast:" line and get next two actual predictions
+            gfd1_line = gfd_lines[1] if len(gfd_lines) > 1 else None
+            gfd2_line = gfd_lines[2] if len(gfd_lines) > 2 else None
 
-            if gfd_result == "Failed to get Gambler's Fever Dream result":
-                gfd_is_good_fthof = False
-            else:
-                gfd_is_good_fthof = (gfd_result.startswith(gfd_forecasts['green_fthof']) and
-                                     not gfd_result.startswith(gfd_forecasts["good_fthof_blab"])
-                                     ) or any(gfd_result.startswith(gfd_forecasts[key]) for key in
-                                              ["ef_fthof", "red_fthof_lump"]) if gfd_result else False
-        else:
-            gfd_result = 'Not enough magic for FTHOF'
-            gfd_is_good_fthof = False
+            def parse_buff_from_forecast(forecast_line):
+                """Extract buff type from forecast line"""
+                if not forecast_line:
+                    return None
 
-        if magic_max - magic >= 100 and not self.debuff_active and current_lumps > 101:
-            cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
-            click_buffs = self.cf_active + self.df_active
-            gfd_f = gfd_result.startswith(gfd_forecasts["green_fthof_frenzy"]) if gfd_result else False
-            gfd_bs = gfd_result.startswith(gfd_forecasts["green_fthof_bs"]) if gfd_result else False
-            gfd_ef = gfd_result.startswith(gfd_forecasts["ef_fthof"]) if gfd_result else False
-            gfd_cf = gfd_result.startswith(gfd_forecasts["green_fthof_cf"]) if gfd_result else False
-            gfd_cps_buff = gfd_f or gfd_bs or gfd_ef
+                # Special cases for beneficial red outcomes
+                if 'Elder Frenzy' in forecast_line:
+                    return 'Elder Frenzy'
+                if 'Free Sugar Lump' in forecast_line:
+                    return 'Free Sugar Lump'
 
-            next_cookie_js = (f"return FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' || "
-                              f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 * "
-                              f"FortuneCookie.getSimGCs(), false)")
-            next_cookie = self.exec_js(script=next_cookie_js, default_return="Failed to get next cookie result.")
-            fthof_frenzy = ">Frenzy<" in next_cookie
-            fthof_cf = ">Click Frenzy<" in next_cookie
-            fthof_bs = ">Building Special<" in next_cookie
-            fthof_ef = ">Elder Frenzy<" in next_cookie
-            fthof_cps_buff = fthof_frenzy or fthof_bs or fthof_ef
+                # Skip other red outcomes that aren't FTHOF predictions
+                if 'red' in forecast_line and 'Force the Hand of Fate' not in forecast_line:
+                    return None
 
-            if (cps_buffs >= 2 and (self.swaps_left > 2 or current_lumps > 102) and
-                (gfd_cf or
-                 (not gfd_is_good_fthof and
-                  fthof_cf))) or (click_buffs and
-                                  ((self.f_active and
-                                    (gfd_bs or gfd_ef or (not gfd_is_good_fthof and (fthof_bs or fthof_ef)))) or
-                                   (self.ef_active and
-                                    (gfd_bs or gfd_f or (not gfd_is_good_fthof and (fthof_frenzy or fthof_bs)))) or
-                                   (self.bs_active and
-                                    (gfd_cps_buff or (not gfd_is_good_fthof and fthof_cps_buff))))):
-                if lump_refill == 0:
-                    self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click')")
-                    print(f"{timestamp()}: {Fore.RED}Spent a lump (had: {current_lumps}) on refilling 100 magic to "
-                          f"Grimoire. Magic was {magic}. {self.swaps_left} swaps left.{Style.RESET_ALL}")
-                    magic = self.exec_js(script=f"return {game}.magic", default_return=0)
+                if 'Click Frenzy' in forecast_line:
+                    return 'Click Frenzy'
+                elif 'Building Special' in forecast_line:
+                    return 'Building Special'
+                elif 'Dragon Harvest' in forecast_line:
+                    return 'Dragon Harvest'
+                elif 'Dragonflight' in forecast_line:
+                    return 'Dragonflight'
+                elif 'Frenzy' in forecast_line and 'Elder' not in forecast_line:
+                    return 'Frenzy'
+                elif 'Lucky' in forecast_line:
+                    return 'Lucky'
+                elif 'Cookie Storm' in forecast_line:
+                    return 'Cookie Storm'
+                elif 'Blab' in forecast_line:
+                    return 'Skip'
+                return None
 
-        buff = any([self.f_active, self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
+            # Get current active buffs
+            active_buffs = {buff['name'] for buff in state['buffs']}
+            min_buff_time = min((buff['time'] for buff in state['buffs']), default=0)
 
-        cast = magic >= magic_max - 1 or (magic >= spell_cost and buff and
-                                          spell_to_cast == "hand of fate") or gfd_is_good_fthof
+            # Parse all possible next buffs
+            fthof1_buff = parse_buff_from_forecast(state['forecasts']['fthof1'])
+            fthof2_buff = parse_buff_from_forecast(state['forecasts']['fthof2'])
+            gfd1_buff = parse_buff_from_forecast(gfd1_line)
+            gfd2_buff = parse_buff_from_forecast(gfd2_line)
 
-        if spell_to_cast == 'summon crafty pixies':
-            print(f"{timestamp()}: Summon Crafty Pixies costs {spell_cost}. Have {magic} magic.")
-            if magic >= spell_cost:
-                scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
-                scp_result = self.exec_js(script=f"return FortuneCookie.spellForecast({scp});", default_return="Failed")
-                # print(f"{timestamp()}: {scp_result}")
-                cast = scp_result.startswith(scp_success) if scp_result else False
-                if not cast:
-                    print(f"{timestamp()}: Spell will backfire; not casting.")
-            else:
-                cast = False
+            def would_stack(new_buff, current_buffs):
+                """Check if new buff would add to current buffs"""
+                if new_buff == 'Skip' or new_buff == 'Lucky' or new_buff == 'Cookie Storm' or new_buff is None or new_buff == 'Free Sugar Lump':
+                    return False
+                # No buff stacks with itself
+                if new_buff in current_buffs:
+                    return False
+                # All other buffs can coexist
+                return new_buff in STACKING_BUFFS
 
-        while cast:
+            def simulate_combo(buff1, buff2, current_buffs):
+                """Simulate adding two buffs to current buffs"""
+                result = current_buffs.copy()
+                if would_stack(buff1, result):
+                    result.add(buff1)
+                # Check stacking against updated buff list including buff1 if it was added
+                if would_stack(buff2, result):
+                    result.add(buff2)
+                return len(result), any(buff in CLICK_BUFFS for buff in result)
+
+            # Check all possible combinations - note that first spell affects which second spell we'll get
+            combos = [
+                ('fthof+fthof', *simulate_combo(fthof1_buff, fthof2_buff, active_buffs)),
+                ('gfd+gfd', *simulate_combo(gfd1_buff, gfd2_buff, active_buffs)),
+                ('fthof+gfd', *simulate_combo(fthof1_buff, gfd2_buff, active_buffs)),  # If we cast FTHOF first
+                ('gfd+fthof', *simulate_combo(gfd1_buff, fthof2_buff, active_buffs))  # If we cast GFD first
+            ]
+
+            # Handle bad outcomes first - if both immediate options are bad, use GFD and reload
             if spell_to_cast == "hand of fate":
-                next_cookie_js = (f"return FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' ||"
-                                  f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 *"
-                                  f"FortuneCookie.getSimGCs(), false)")
-                next_cookie = self.exec_js(script=next_cookie_js, default_return="Failed")
-                if next_cookie:
-                    fthof_results = {
-                        "lucky": ">Lucky<" in next_cookie,
-                        "frenzy": ">Frenzy<" in next_cookie,
-                        "click_frenzy": ">Click Frenzy<" in next_cookie,
-                        "cookie_storm": "Cookie Storm" in next_cookie,
-                        "blab": ">Blab<" in next_cookie,
-                        "building_special": ">Building Special<" in next_cookie,
-                        "free_sugar_lump": ">Free Sugar Lump<" in next_cookie,
-                        "clot": ">Clot<" in next_cookie,
-                        "ruin": ">Ruin<" in next_cookie,
-                        "cursed_finger": ">Cursed Finger<" in next_cookie,
-                        "elder_frenzy": ">Elder Frenzy<" in next_cookie
-                    }
-                else:
+                fthof_cost = state['spellCosts']['fthof']
+                gfd_cost = state['spellCosts']['gfd']
+                half_fthof = fthof_cost / 2
+                can_refill = state['lumps'] > 101 and not state['lumpRefill']
+
+                if (fthof1_buff is None and gfd1_buff is None and
+                        state['magic'] >= state['maxMagic'] - 1):
+                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                    self.save_game(path=self.save_file)
+                    print(f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid bad outcomes. "
+                          f"Magic was {state['magic']}.{Style.RESET_ALL}")
+                    time.sleep(1)
+                    self.load_save()
                     return
-                cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
-                fthof_best = any([fthof_results[key] for key in ["frenzy", "click_frenzy", "cookie_storm",
-                                                                 "building_special", "free_sugar_lump", "elder_frenzy",
-                                                                 "cursed_finger"]])
-                no_frenzy_buff = any([self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
 
-                if any([fthof_results[key] for key in ["blab", "clot", "ruin"]]):
-                    if magic >= (gfd_cost + fthof_cost):
-                        bad_spell = next((spell for spell in ["Blab", "Clot", "Ruin"] if fthof_results[spell.lower()]),
-                                         "Unknown")
+                # Find best combo that includes a click buff and results in 4+ buffs
+                best_combo = None
+                for combo_name, buff_count, has_click in combos:
+                    if buff_count >= 4 and has_click and min_buff_time > 10:
+                        best_combo = combo_name
+                        break
 
-                        self.exec_js(script=f"{game}.castSpell({gfd});")
-                        self.save_game(path=self.save_file)
-                        print(
-                            f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid FTHOF {bad_spell}. "
-                            f"Magic was {magic}.{Style.RESET_ALL}")
-                        time.sleep(1)
-                        self.load_save()
+                if best_combo:
+                    # Calculate magic costs - GFD casting FTHOF adds half FTHOF cost
+                    magic_needed = {
+                        'fthof+fthof': fthof_cost * 2,
+                        'gfd+gfd': gfd_cost + half_fthof + gfd_cost + half_fthof,  # Both GFDs might cast FTHOF
+                        'fthof+gfd': fthof_cost + (gfd_cost + half_fthof),
+                        'gfd+fthof': (gfd_cost + half_fthof) + fthof_cost
+                    }
 
-                elif magic >= magic_max - 1 or (self.debuff_active and fthof_results["cursed_finger"]) or \
-                        fthof_results["free_sugar_lump"] or (
-                        no_frenzy_buff and not self.debuff_active and any([fthof_results["frenzy"],
-                                                                           fthof_results["click_frenzy"],
-                                                                           fthof_results["cookie_storm"],
-                                                                           fthof_results["building_special"],
-                                                                           fthof_results["elder_frenzy"]])
-                ) or (buff and not self.debuff_active and any(
-                    [fthof_results["click_frenzy"], fthof_results["cookie_storm"],
-                     fthof_results["building_special"], fthof_results["elder_frenzy"]])
-                ) or (fthof_results["lucky"] and cps_buffs >= 2):
-                    if gfd_is_good_fthof and gfd_forecasts["good_fthof_lucky"] and not fthof_best:
-                        print(f"{timestamp()}: {Fore.GREEN}Casting Gambler's Fever Dream. Magic was {magic}."
-                              f"{Style.RESET_ALL}")
-                        self.exec_js(script=f"{game}.castSpell({gfd})")
-                    elif magic >= fthof_cost:
-                        print(f"{timestamp()}: {Fore.GREEN}Casting Force the Hand of Fate. Magic was {magic}."
-                              f"{Style.RESET_ALL}")
-                        self.exec_js(script=f"{game}.castSpell({spell})")
-                    self.set_cps_multiplier()
-                cast = False
-            else:
-                if spell_to_cast == "resurrect abomination":
-                    self.pop_fattest_wrinkler()
+                                        # For refill to work:
+                    # 1. Must have enough lumps and no cooldown
+                    # 2. Current magic must be enough for first cast
+                    # 3. Refill after first cast must provide enough for second cast
+                    # Check if we have enough lumps and no refill cooldown
 
-                self.exec_js(script=f"{game}.castSpell({spell})")
-                print(f"{timestamp()}: {Fore.GREEN}Casting {spell_to_cast}.{Style.RESET_ALL}")
-                if exhaust_magic:
-                    spell_cost = self.exec_js(script=f"return {game}.getSpellCost({spell});",
-                                              default_return=float('inf'))
-                    magic = self.exec_js(script=f"return {game}.magic;", default_return=0)
-                    cast = magic >= spell_cost + buffer
+                    def click_golden_cookies():
+                        """Click any golden cookies on screen"""
+                        self.exec_js(script="""
+                            for (var sx in Game.shimmers) {
+                                var s = Game.shimmers[sx];
+                                if (s.type == "golden") {
+                                    s.pop();
+                                }
+                            };
+                        """)
+
+
+                    if best_combo == 'fthof+fthof' and can_refill:
+                        # Check if we can cast first FTHOF and have enough after refill for second
+                        if state['magic'] >= fthof_cost:  # Can cast first FTHOF
+                            magic_after_cast = state['magic'] - fthof_cost
+                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
+                            can_cast_again = magic_after_cast + refill_amount >= fthof_cost  # Can cast second
+
+                            if can_cast_again:
+                                print(f"{timestamp()}: Executing FTHOF+FTHOF combo")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                                click_golden_cookies()
+                                self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
+                                print(
+                                    f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                                click_golden_cookies()
+
+                                self.pantheon()
+
+                    elif best_combo == 'gfd+gfd':
+                        # Check if we can cast first GFD and have enough after possible refill for second
+                        first_cost = gfd_cost + half_fthof
+                        second_cost = gfd_cost + half_fthof
+                        if state['magic'] >= first_cost:  # Can cast first GFD
+                            magic_after_cast = state['magic'] - first_cost
+                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
+                            can_cast_again = magic_after_cast + refill_amount >= second_cost
+
+                            if can_cast_again:
+                                print(f"{timestamp()}: Executing GFD+GFD combo")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                                click_golden_cookies()
+                                if magic_after_cast < second_cost:
+                                    self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
+                                    print(
+                                        f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                                click_golden_cookies()
+
+                                self.pantheon()
+
+                    elif best_combo == 'fthof+gfd':
+                        # Check if we can cast FTHOF and have enough after refill for GFD
+                        if state['magic'] >= fthof_cost:  # Can cast FTHOF
+                            magic_after_cast = state['magic'] - fthof_cost
+                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
+                            can_cast_again = magic_after_cast + refill_amount >= (gfd_cost + half_fthof)
+
+                            if can_cast_again:
+                                print(f"{timestamp()}: Executing FTHOF+GFD combo")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                                click_golden_cookies()
+                                self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
+                                print(
+                                    f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                                click_golden_cookies()
+
+                                self.pantheon()
+
+                    else:  # gfd+fthof
+                        first_cost = gfd_cost + half_fthof
+                        if state['magic'] >= first_cost:  # Can cast GFD
+                            magic_after_cast = state['magic'] - first_cost
+                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
+                            can_cast_again = magic_after_cast + refill_amount >= fthof_cost
+
+                            if can_cast_again:
+                                print(f"{timestamp()}: Executing GFD+FTHOF combo")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                                click_golden_cookies()
+                                self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
+                                print(
+                                    f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                                click_golden_cookies()
+
+                                self.pantheon()
+
+                    self.get_active_buffs()
+
                 else:
-                    cast = False
-            self.click_golden_cookies = True
+                    # Check for single good outcomes when magic is near max
+                    near_max_magic = state['magic'] >= (state['maxMagic'] - 1)
+
+                    # Helper function to rank buff outcomes
+                    def get_buff_value(buff):
+                        if buff == 'Free Sugar Lump':
+                            return 4  # Highest priority
+                        if buff in CLICK_BUFFS:
+                            return 3  # Click buffs are very valuable
+                        if buff in STACKING_BUFFS:
+                            return 2  # Other stacking buffs
+                        if buff in ['Cookie Storm', 'Lucky']:
+                            return 1  # Lucky/Cookie Storm
+                        if buff == 'Skip':
+                            return 0  # Skip
+                        return -1    # None or backfire
+
+                    # Get values for both spells
+                    fthof_value = get_buff_value(fthof1_buff)
+                    gfd_value = get_buff_value(gfd1_buff)
+
+                    if near_max_magic:
+                        # Cast spell if we have any good outcome
+                        if max(fthof_value, gfd_value) > 0:
+                            # If GFD result matches FTHOF, prefer GFD as it costs less
+                            if gfd_value >= fthof_value and state['magic'] >= (gfd_cost + half_fthof):
+                                print(f"{timestamp()}: Casting GFD for {gfd1_buff}")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                            elif fthof_value > 0 and state['magic'] >= fthof_cost:
+                                print(f"{timestamp()}: Casting FTHOF for {fthof1_buff}")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+
+                            if fthof1_buff == 'Free Sugar Lump' or gfd1_buff == 'Free Sugar Lump':
+                                print(f"{timestamp()}: Got Free Sugar Lump!")
+
+        except JavascriptException:
+            print(f"{timestamp()}: Failed to cast spell")
+
+    # def cast_spell(self, spell_to_cast, exhaust_magic=False):
+    #     game = 'Game.Objects["Wizard tower"].minigame'
+    #     spell = f'{game}.spells["{spell_to_cast}"]'
+    #     fthof = f'{game}.spells["hand of fate"]'
+    #     gfd = f'{game}.spellsById[6]'  # Gambler's Fever Dream
+    #     scp = f'{game}.spellsById[5]'  # Summon Crafty Pixies
+    #     gfd_forecasts = {
+    #         "green_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate',
+    #         "green_fthof_cf": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Click Frenzy)',
+    #         "green_fthof_bs": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Building Special)',
+    #         "green_fthof_frenzy": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Frenzy)',
+    #         "good_fthof_lucky": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                             '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Lucky)',
+    #         "good_fthof_blab": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                            '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Blab)',
+    #         "ef_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
+    #                     '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Elder Frenzy)',
+    #         "red_fthof_lump": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
+    #                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Free Sugar Lump'
+    #     }
+    #     buffer = 21
+    #
+    #     (magic,
+    #      magic_max,
+    #      spell_cost,
+    #      current_lumps,
+    #      lump_refill,
+    #      fthof_cost,
+    #      gfd_cost) = self.exec_js(script=f'return [{game}.magic, {game}.magicM, {game}.getSpellCost({spell}), '
+    #                                      f'Game.lumps, Game.lumpRefill, {game}.getSpellCost({fthof}), '
+    #                                      f'{game}.getSpellCost({gfd})];', default_return=[None] * 7)
+    #
+    #     if any(var is None for var in (magic, magic_max, spell_cost, current_lumps, fthof_cost, gfd_cost)):
+    #         return
+    #
+    #     fthof_half_cost = fthof_cost / 2
+    #     gfd_cast_fthof_cost = fthof_half_cost + gfd_cost
+    #
+    #     if spell_to_cast == "gambler's fever dream":
+    #         if magic < (spell_cost + fthof_half_cost) * 2:
+    #             self.click_golden_cookies = False
+    #             print(f'{timestamp()}: Waiting for enough magic to get Four-leaf cookie')
+    #             return
+    #
+    #         for _ in range(2):
+    #             self.click_cookie()
+    #             self.exec_js(script=f"{game}.castSpell({spell});")
+    #
+    #         self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
+    #         print(f"{timestamp()}: Spending one lump to refill Grimoire.")
+    #         self.exec_js(script=f"{game}.castSpell({fthof});")
+    #         while not self.check_achievements('Four-leaf cookie'):
+    #             pass
+    #         self.click_golden_cookies = True
+    #
+    #         return
+    #
+    #     spells_cast = self.exec_js(script=f"return {game}.spellsCastTotal;")
+    #
+    #     if spells_cast == self.spell_count_four_leaf_cookie or spells_cast is None:
+    #         return
+    #
+    #     if magic >= gfd_cast_fthof_cost:
+    #         gfd_result = self.exec_js(script=f"return FortuneCookie.spellForecast({gfd});",
+    #                                   default_return="Failed to get Gambler's Fever Dream result")
+    #
+    #         if gfd_result == "Failed to get Gambler's Fever Dream result":
+    #             gfd_is_good_fthof = False
+    #         else:
+    #             gfd_is_good_fthof = (gfd_result.startswith(gfd_forecasts['green_fthof']) and
+    #                                  not gfd_result.startswith(gfd_forecasts["good_fthof_blab"])
+    #                                  ) or any(gfd_result.startswith(gfd_forecasts[key]) for key in
+    #                                           ["ef_fthof", "red_fthof_lump"]) if gfd_result else False
+    #     else:
+    #         gfd_result = 'Not enough magic for FTHOF'
+    #         gfd_is_good_fthof = False
+    #
+    #     if magic_max - magic >= 100 and not self.debuff_active and current_lumps > 101:
+    #         cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
+    #         click_buffs = self.cf_active + self.df_active
+    #         gfd_f = gfd_result.startswith(gfd_forecasts["green_fthof_frenzy"]) if gfd_result else False
+    #         gfd_bs = gfd_result.startswith(gfd_forecasts["green_fthof_bs"]) if gfd_result else False
+    #         gfd_ef = gfd_result.startswith(gfd_forecasts["ef_fthof"]) if gfd_result else False
+    #         gfd_cf = gfd_result.startswith(gfd_forecasts["green_fthof_cf"]) if gfd_result else False
+    #         gfd_cps_buff = gfd_f or gfd_bs or gfd_ef
+    #
+    #         next_cookie_js = (f"return FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' || "
+    #                           f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 * "
+    #                           f"FortuneCookie.getSimGCs(), false)")
+    #         next_cookie = self.exec_js(script=next_cookie_js, default_return="Failed to get next cookie result.")
+    #         fthof_frenzy = ">Frenzy<" in next_cookie
+    #         fthof_cf = ">Click Frenzy<" in next_cookie
+    #         fthof_bs = ">Building Special<" in next_cookie
+    #         fthof_ef = ">Elder Frenzy<" in next_cookie
+    #         fthof_cps_buff = fthof_frenzy or fthof_bs or fthof_ef
+    #
+    #         if (cps_buffs >= 2 and (self.swaps_left > 2 or current_lumps > 102) and
+    #             (gfd_cf or
+    #              (not gfd_is_good_fthof and
+    #               fthof_cf))) or (click_buffs and
+    #                               ((self.f_active and
+    #                                 (gfd_bs or gfd_ef or (not gfd_is_good_fthof and (fthof_bs or fthof_ef)))) or
+    #                                (self.ef_active and
+    #                                 (gfd_bs or gfd_f or (not gfd_is_good_fthof and (fthof_frenzy or fthof_bs)))) or
+    #                                (self.bs_active and
+    #                                 (gfd_cps_buff or (not gfd_is_good_fthof and fthof_cps_buff))))):
+    #             if lump_refill == 0:
+    #                 self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click')")
+    #                 print(f"{timestamp()}: {Fore.RED}Spent a lump (had: {current_lumps}) on refilling 100 magic to "
+    #                       f"Grimoire. Magic was {magic}. {self.swaps_left} swaps left.{Style.RESET_ALL}")
+    #                 magic = self.exec_js(script=f"return {game}.magic", default_return=0)
+    #
+    #     buff = any([self.f_active, self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
+    #
+    #     cast = magic >= magic_max - 1 or (magic >= spell_cost and buff and
+    #                                       spell_to_cast == "hand of fate") or gfd_is_good_fthof
+    #
+    #     if spell_to_cast == 'summon crafty pixies':
+    #         print(f"{timestamp()}: Summon Crafty Pixies costs {spell_cost}. Have {magic} magic.")
+    #         if magic >= spell_cost:
+    #             scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
+    #                            '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
+    #             scp_result = self.exec_js(script=f"return FortuneCookie.spellForecast({scp});", default_return="Failed")
+    #             # print(f"{timestamp()}: {scp_result}")
+    #             cast = scp_result.startswith(scp_success) if scp_result else False
+    #             if not cast:
+    #                 print(f"{timestamp()}: Spell will backfire; not casting.")
+    #         else:
+    #             cast = False
+    #
+    #     while cast:
+    #         if spell_to_cast == "hand of fate":
+    #             next_cookie_js = (f"return FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' ||"
+    #                               f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 *"
+    #                               f"FortuneCookie.getSimGCs(), false)")
+    #             next_cookie = self.exec_js(script=next_cookie_js, default_return="Failed")
+    #             if next_cookie:
+    #                 fthof_results = {
+    #                     "lucky": ">Lucky<" in next_cookie,
+    #                     "frenzy": ">Frenzy<" in next_cookie,
+    #                     "click_frenzy": ">Click Frenzy<" in next_cookie,
+    #                     "cookie_storm": "Cookie Storm" in next_cookie,
+    #                     "blab": ">Blab<" in next_cookie,
+    #                     "building_special": ">Building Special<" in next_cookie,
+    #                     "free_sugar_lump": ">Free Sugar Lump<" in next_cookie,
+    #                     "clot": ">Clot<" in next_cookie,
+    #                     "ruin": ">Ruin<" in next_cookie,
+    #                     "cursed_finger": ">Cursed Finger<" in next_cookie,
+    #                     "elder_frenzy": ">Elder Frenzy<" in next_cookie
+    #                 }
+    #             else:
+    #                 return
+    #             cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
+    #             fthof_best = any([fthof_results[key] for key in ["frenzy", "click_frenzy", "cookie_storm",
+    #                                                              "building_special", "free_sugar_lump", "elder_frenzy",
+    #                                                              "cursed_finger"]])
+    #             no_frenzy_buff = any([self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
+    #
+    #             if any([fthof_results[key] for key in ["blab", "clot", "ruin"]]):
+    #                 if magic >= (gfd_cost + fthof_cost):
+    #                     bad_spell = next((spell for spell in ["Blab", "Clot", "Ruin"] if fthof_results[spell.lower()]),
+    #                                      "Unknown")
+    #
+    #                     self.exec_js(script=f"{game}.castSpell({gfd});")
+    #                     self.save_game(path=self.save_file)
+    #                     print(
+    #                         f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid FTHOF {bad_spell}. "
+    #                         f"Magic was {magic}.{Style.RESET_ALL}")
+    #                     time.sleep(1)
+    #                     self.load_save()
+    #
+    #             elif magic >= magic_max - 1 or (self.debuff_active and fthof_results["cursed_finger"]) or \
+    #                     fthof_results["free_sugar_lump"] or (
+    #                     no_frenzy_buff and not self.debuff_active and any([fthof_results["frenzy"],
+    #                                                                        fthof_results["click_frenzy"],
+    #                                                                        fthof_results["cookie_storm"],
+    #                                                                        fthof_results["building_special"],
+    #                                                                        fthof_results["elder_frenzy"]])
+    #             ) or (cps_buffs >= 2 and not self.debuff_active and any( # Trying to use cps_buffs count instead of buff
+    #                 [fthof_results["click_frenzy"], fthof_results["cookie_storm"],
+    #                  fthof_results["building_special"], fthof_results["elder_frenzy"]])
+    #             ) or (fthof_results["lucky"] and cps_buffs >= 2):
+    #                 if gfd_is_good_fthof and gfd_forecasts["good_fthof_lucky"] and not fthof_best:
+    #                     print(f"{timestamp()}: {Fore.GREEN}Casting Gambler's Fever Dream. Magic was {magic}."
+    #                           f"{Style.RESET_ALL}")
+    #                     self.exec_js(script=f"{game}.castSpell({gfd})")
+    #                 elif magic >= fthof_cost:
+    #                     print(f"{timestamp()}: {Fore.GREEN}Casting Force the Hand of Fate. Magic was {magic}."
+    #                           f"{Style.RESET_ALL}")
+    #                     self.exec_js(script=f"{game}.castSpell({spell})")
+    #                 self.set_cps_multiplier()
+    #             cast = False
+    #         else:
+    #             if spell_to_cast == "resurrect abomination":
+    #                 self.pop_fattest_wrinkler()
+    #
+    #             self.exec_js(script=f"{game}.castSpell({spell})")
+    #             print(f"{timestamp()}: {Fore.GREEN}Casting {spell_to_cast}.{Style.RESET_ALL}")
+    #             if exhaust_magic:
+    #                 spell_cost = self.exec_js(script=f"return {game}.getSpellCost({spell});",
+    #                                           default_return=float('inf'))
+    #                 magic = self.exec_js(script=f"return {game}.magic;", default_return=0)
+    #                 cast = magic >= spell_cost + buffer
+    #             else:
+    #                 cast = False
+    #         self.click_golden_cookies = True
 
     def try_for_shriekbulbs(self):
         duketater = self.plants["duketater"]
@@ -2569,7 +2935,8 @@ class CookieClicker:
             self.dragon_complete = False
             self.handle_ascension = False
             self.ascension_mode = None
-            input("Select Permanent Upgrade options and press Return to continue.")
+            # TODO: Figure out how to handle permanent upgrades
+            # input("Select Permanent Upgrade options and press Return to continue.")
             try:
                 self.driver.execute_script("javascript:Game.Reincarnate(true);")
             except JavascriptException:
@@ -2695,7 +3062,7 @@ class CookieClicker:
                                                                                           ):
                         self.pantheon()
 
-                    if click:
+                    if self.f_active + self.cf_active + self.bs_active + self.ef_active + self.dh_active + self.df_active >=2:
                         self.cast_spell(spell_to_cast="hand of fate", exhaust_magic=False)
                     if self.crafty_pixies:
                         self.buy_products()
@@ -3002,6 +3369,9 @@ class CookieClicker:
 
                 self.click_cookie()
 
+                if upgrade['bought']:
+                    continue
+
                 if '"' in upgrade['name']:
                     js = f"return CookieMonsterData.Upgrades['{upgrade['name']}'];"
                 else:
@@ -3009,7 +3379,8 @@ class CookieClicker:
 
                 cookie_monster_data = self.exec_js(script=js)
                 if not cookie_monster_data:
-                    print(f"{timestamp()}: {Fore.LIGHTRED_EX}CookieMonsterData is None.{Style.RESET_ALL}")
+                    print(f"{timestamp()}: {Fore.LIGHTRED_EX}CookieMonsterData is None for {upgrade['name']}."
+                          f"{Style.RESET_ALL}")
                     return
 
                 if upgrade['name'] in self.overrides:
@@ -3076,19 +3447,14 @@ class CookieClicker:
 
     def stock_market(self):
         market = 'Game.Objects["Bank"].minigame'
+
+        # Only check market every 1 minute unless specific conditions are met
+        current_time = time.time()
+        if current_time < getattr(self, 'next_market_check', 0):
+            return
+        self.next_market_check = current_time + 60  # 1 minute
+
         goods_by_id = f'{market}.goodsById'
-        market_achievements = {
-            'Initial public offering': False,
-            'Rookie numbers': False,
-            'No nobility in poverty': False,
-            'Full warehouses': False,
-            'Make my day': False,
-            'Buy buy buy': False,
-            'Pyramid scheme': False,
-            'Liquid assets': False,
-            'Debt evasion': False,
-            'Gaseous assets': False
-        }
         goods_price_list = {
             1: {
                 0: [5.715947633009222, 58.21594763300922],
@@ -3312,13 +3678,26 @@ class CookieClicker:
             }
         }
 
-        for market_achievement in market_achievements:
-            self.click_cookie()
-            market_achievements[market_achievement] = self.check_achievements(market_achievement)
 
-        all_market_achievements_unlocked = all(value == 1 for value in market_achievements.values())
+        # Cache achievement checks in one call
+        achievements = self.exec_js(script="""
+            return {
+                ipo: Game.Achievements['Initial public offering'].won,
+                rookie: Game.Achievements['Rookie numbers'].won,
+                nobility: Game.Achievements['No nobility in poverty'].won,
+                warehouses: Game.Achievements['Full warehouses'].won,
+                makeDay: Game.Achievements['Make my day'].won,
+                buyBuy: Game.Achievements['Buy buy buy'].won,
+                pyramid: Game.Achievements['Pyramid scheme'].won,
+                liquid: Game.Achievements['Liquid assets'].won,
+                debt: Game.Achievements['Debt evasion'].won,
+                gaseous: Game.Achievements['Gaseous assets'].won
+            }
+        """, default_return={})
 
-        if not all_market_achievements_unlocked or True:
+        all_achieved = all(value == 1 for value in achievements.values())
+
+        if not all_achieved or True:
             cursor_level, cursor_amount = self.exec_js(script="return [Game.Objects['Cursor'].level, "
                                                               "Game.Objects['Cursor'].amount]", default_return=[-1, -1])
 
@@ -3390,15 +3769,14 @@ class CookieClicker:
                         sell_price = goods_price_list[bank_level][good_id][1]
 
                         if (stock_price <= buy_price and stock_shares != stock_max) or (
-                                not market_achievements['Buy buy buy'] and
+                                not achievements['buyBuy'] and
                                 stock_price * (1 + overhead) * (stock_max - stock_shares) >= 86400
                         ):
                             print(f'{timestamp()}: {Fore.GREEN}Buying {good_name} ({good_symbol}) at '
                                   f'{stock_price:.2f} < {buy_price}.{Style.RESET_ALL}')
                             self.exec_js(script=f"{market}.buyGood({good_id}, {stock_max});")
                         elif stock_shares > 0 and stock_price >= sell_price:
-                            if market_achievements['No nobility in poverty'] or min_shares >= 500 or \
-                                    all_market_achievements_unlocked:
+                            if achievements['nobility'] or min_shares >= 500 or all_achieved:
                                 print(f'{timestamp()}: {Fore.RED}Selling {good_name} ({good_symbol}) at '
                                       f'{stock_price:.2f} > {sell_price}.{Style.RESET_ALL}')
                                 self.exec_js(script=f"{market}.sellGood({good_id}, {stock_max});")
@@ -3547,7 +3925,7 @@ class CookieClicker:
             frenzy_cookies = avg_golden_cookies_per_day * .2943
             frenzy_time = frenzy_cookies * 77 * effect_duration
             frenzy_reindeer = frenzy_time / avg_time_between_reindeer_spawns
-            clot_cookies = avg_golden_cookies_per_day * .09332
+            clot_cookies = avg_golden_cookies_per_day * .09332 * 0 # Eliminated clots by reloading from save
             clot_time = clot_cookies * 66 * effect_duration
             clot_reindeer = clot_time / avg_time_between_reindeer_spawns
             elder_frenzy_cookies = avg_golden_cookies_per_day * .02022
@@ -3803,7 +4181,7 @@ class CookieClicker:
                                            self.df_active) and (self.bs_active +
                                                                 self.f_active +
                                                                 self.ef_active +
-                                                                self.dh_active >= 2) and (self.swaps_left == 3 and
+                                                                self.dh_active >= 3) and (self.swaps_left == 3 and
                                                                                           self.cpsMult > CPS_THRESHOLD):
                 diamond_god = 'godzamok'
 
