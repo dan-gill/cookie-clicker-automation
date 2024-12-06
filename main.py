@@ -43,6 +43,7 @@ while is_game_on and not save_and_exit:
 
     # Check memory less frequently (e.g., every 5 minutes)
     if current_time >= getattr(cookie_clicker, 'next_memory_check', 0):
+        cookie_clicker.clear_memory()
         if psutil.virtual_memory().available < MIN_AVAILABLE_MEMORY_GB:
             ts = time.localtime()
             print(f"{ts.tm_hour:02}:{ts.tm_min:02}:{ts.tm_sec:02}: {Fore.YELLOW}Reloading browser because memory is low."
@@ -87,7 +88,7 @@ while is_game_on and not save_and_exit:
         cookie_clicker.switch_soil()
         cookie_clicker.next_garden_check = current_time + 30  # Check every 30 seconds
 
-    cookie_clicker.level_up()
+    # cookie_clicker.level_up()
     cookie_clicker.harvest_lumps()
     cookie_clicker.train_dragon()
     cookie_clicker.pet_the_dragon()

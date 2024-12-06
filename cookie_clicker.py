@@ -3,8 +3,8 @@ import time
 from collections import OrderedDict
 from os import getenv, remove
 from os.path import exists
-from scipy.optimize import fsolve
-import traceback
+
+import traceback, gc, psutil, os
 
 import humanize
 import numpy as np
@@ -24,7 +24,21 @@ load_dotenv()
 colorama_init()
 CHROME_BINARY_FULL_PATH = getenv("CHROME_BINARY_FULL_PATH")
 SECONDS_UNTIL_NEXT_TICK = 20
+SECONDS_BTWN_SAVES = 45
 CPS_THRESHOLD = 1
+AC_CLICKS = 30 # 17 seems to be the upper limit for CPS, but 3 seems to be the upper limit for cookies from clicking/s
+AC_MS = 1 # However, Avg cookies/s seems to be highest with 20 in AC_CLICKS
+# Define buff categories
+CLICK_BUFFS = {'Click frenzy', 'Dragonflight', 'Elder frenzy'}
+BUILDING_SPECIALS = {
+    'High-five', 'Congregation', 'Luxuriant harvest', 'Ore vein',
+    'Oiled-up', 'Juicy profits', 'Fervent adoration', 'Manabloom',
+    'Delicious lifeforms', 'Breakthrough', 'Righteous cataclysm',
+    'Golden ages', 'Extra cycles', 'Solar flare', 'Winning streak',
+    'Macrocosm', 'Refactoring', 'Cosmic nursery', 'Brainstorm',
+    'Deduplication'
+}
+STACKING_BUFFS = CLICK_BUFFS | {'Building Special', 'Dragon Harvest', 'Frenzy'}
 
 
 def timestamp():
@@ -35,14 +49,16 @@ def timestamp():
 class CookieClicker:
     def __init__(self, save_file, building_level_goal, handle_ascension):
         self.handle_ascension = handle_ascension
-        self.cookie_click_errors = 0
+        self.cookie_click_errors = self.reset_bonus_percent = self.prestige = self.new_prestige = 0
         self.current_soil_id = self.ascension_mode = None
         self.debuff_active = self.cursed_finger_active = self.planted_this_tick = self.harvested_this_tick = False
-        self.f_active = self.bs_active = self.dh_active = self.df_active = self.cf_active = self.ef_active = False
-        self.delay_aura_change = self.time_last_wrinkler_popped = time.time()
-        self.upgrades_to_buy = []
+        self.f_active = self.bs_active = self.dh_active = self.df_active = self.cf_active = self.ef_active = None
+        self.f_count = self.bs_count = self.dh_count = self.df_count = self.cf_count = self.ef_count = self.cursed_finger_count = self.debuff_count = 0
+        self.delay_aura_change = self.time_last_wrinkler_popped = self.next_cps_update = time.time()
+        self.upgrades_to_buy = self.active_debuffs = self.active_buffs =[]
         self.dragon_auras = self.dragon_auras_lookup = self.driver = self.buildings_owned = None
         self.cps_threshold = 50
+        self.print_prestige = float('inf')
         self.chromedriver = "/opt/homebrew/bin/chromedriver"
         # Install Chrome for testing: npx @puppeteer/browsers install chrome@stable
         self.service = Service(self.chromedriver)
@@ -59,14 +75,17 @@ class CookieClicker:
         self.final_wanted_aura = self.final_wanted_aura2 = self.desired_soil = None
         self.is_veil_active = self.season_active = self.dragon_upgrades_complete = self.sugar_frenzy_spend = False
         self.delay_product_purchase_until_after = self.cursed_finger_upgrades_next_time = time.time()
-        self.time_next_save = time.time() + 60
+        self.time_next_save = time.time() + SECONDS_BTWN_SAVES
+        # Add cleanup interval
+        self.next_cleanup = time.time() + 600  # 10 minutes
+        self._cached_data = {}
         self.harvest_when_mature = ['bakeberry', 'chocoroot', 'whiteChocoroot', 'queenbeet', 'duketater']
         self.harvest_before_decay = ['crumbspore', 'doughshroom']
         self.next_garden_tick = self.swaps_left = 0
-        self.previous_garden_tick = 0
+        self.previous_garden_tick = self.last_spell_status_print = 0
         self.plot_boost = None
         self.plot = None
-        self.next_soil_time = 0
+        self.next_soil_time = self.next_market_check = 0
         self.attempt_to_unlock_seeds = True
         self.last_garden_check_time = self.last_buffed_harvest = self.last_debuffed_planting = time.time() - (60 * 15)
         self.last_harvest_check = self.last_garden_clean = self.last_plant_time = time.time() - (60 * 15)
@@ -74,8 +93,8 @@ class CookieClicker:
         self.dragon_level = 0
         self.max_dragon_level = 0
         self.endless_cycle_achievement_won = self.crafty_pixies = self.true_neverclick = False
-        self.dragon_complete = False
-        self.title = None
+        self.dragon_complete = self.godzamok_ascension_delay = False
+        self.title = self.interval_id = None
         self.farm_level = 0
         self.all_garden_drops_unlocked = False
         self.farm_minigame = "Game.Objects['Farm'].minigame"
@@ -195,12 +214,47 @@ class CookieClicker:
         self.clicking_upgrades = [75, 76, 77, 78, 119, 190, 191, 366, 367, 427, 460, 461, 661, 765, 874]
         self.cost_scaling_upgrades = [648, 649, 650, 651, 473, 474, 475]
 
+    def autoclicker(self, amount_of_clicks, ms_interval):
+        if self.interval_id:
+            stack = traceback.extract_stack()
+            filename, lineno, function_name, code = stack[-2]
+            # print(f"{timestamp()}: Called from {filename}, line {lineno}, in {function_name}: {code}")
+
+            print(f"{timestamp()}: {Fore.LIGHTCYAN_EX}Interval ID: {self.interval_id} needs to be cleared first. "
+                  f"Called from line {lineno} in {function_name}.{Style.RESET_ALL}")
+            return
+
+        script=f"""
+        var autoClicker = function(clicksAtOnce, repeatInterval) {{
+          var cheated = false;
+          var intoTheAbyss = function() {{
+            if(!cheated) {{
+              cheated = true;
+              for(var i = 0; i < clicksAtOnce; i++) {{
+                Game.ClickCookie();
+                Game.lastClick = 0;
+              }}
+              cheated = false;
+            }}
+          }};
+          return setInterval(intoTheAbyss, repeatInterval);
+        }};
+        return autoClicker({amount_of_clicks}, {ms_interval});
+        """
+
+        if (not self.is_veil_active or self.season_active) and (self.ascension_mode == 0 or
+                                                                self.true_neverclick):
+            self.interval_id = self.driver.execute_script(f"javascript:{script}")
+            print(f"{timestamp()}: Interval ID for autoclicker: {self.interval_id}")
+
     def exec_js(self, script, default_return=None):
         click_cookie = (not self.is_veil_active or self.season_active) and (self.ascension_mode == 0 or
                                                                             self.true_neverclick)
 
         try:
             if click_cookie:
+                if not self.interval_id:
+                    self.autoclicker(amount_of_clicks=AC_CLICKS, ms_interval=AC_MS)
                 return self.driver.execute_script(f"javascript:Game.ClickCookie(); {script}")
             else:
                 return self.driver.execute_script(f"javascript:{script}")
@@ -211,6 +265,57 @@ class CookieClicker:
             print(f"{timestamp()}: Script timed out running: {script}")
             print(f"{timestamp()}: Reloading.")
             self.reload_cookieclicker(skip_save=True)
+
+    def cleanup(self):
+        """Clear cached data periodically"""
+        current_time = time.time()
+        if current_time >= self.next_cleanup:
+            # Get memory info before cleanup
+            process = psutil.Process(os.getpid())
+            before_python_mem = process.memory_info().rss / (1024 * 1024)  # RSS in MB
+            before_count = gc.get_count()
+            before_stats = self.exec_js('return window.performance.memory;')
+
+            # Perform cleanup
+            self._cached_data.clear()
+            collected = gc.collect()
+
+            # Get memory info after cleanup
+            after_python_mem = process.memory_info().rss / (1024 * 1024)
+            after_count = gc.get_count()
+            after_stats = self.exec_js('return window.performance.memory;')
+
+            # Print cleanup results
+            print(f"{timestamp()}: Memory cleanup completed:")
+            print(f"  Python process memory: {before_python_mem:.1f}MB → {after_python_mem:.1f}MB")
+            print(f"  Python objects collected: {collected}")
+            print(f"  GC count before: {before_count}, after: {after_count}")
+            if before_stats and after_stats:  # Chrome-only stats
+                before_mb = before_stats.get('usedJSHeapSize', 0) / (1024 * 1024)
+                after_mb = after_stats.get('usedJSHeapSize', 0) / (1024 * 1024)
+                print(f"  JS Heap memory: {before_mb:.1f}MB → {after_mb:.1f}MB")
+
+                # If Python process memory is too high, do a full reload
+                if after_python_mem > 1000 or after_mb > 2000:  # 1GB and 2GB threshold
+                    print(f"{timestamp()}: Python memory usage too high ({after_python_mem:.1f}MB), performing full reload...")
+                    self.reload_cookieclicker()
+                    after_stats = self.exec_js('return window.performance.memory;')
+                    if after_stats:
+                        after_mb = after_stats.get('usedJSHeapSize', 0) / (1024 * 1024)
+                        print(f"  JS Heap memory after reset: {after_mb:.1f}MB")
+                    after_python_mem = process.memory_info().rss / (1024 * 1024)
+                    print(f"{timestamp()}: Python memory usage after reload: {after_python_mem:.1f}MB")
+                self.next_cleanup = current_time + 600
+
+    def clear_memory(self):
+        """Clear browser memory periodically"""
+        try:
+            self.exec_js(script="""
+                // Force garbage collection
+                window.gc && window.gc();
+            """)
+        except JavascriptException:
+            print(f"{timestamp()}: Failed to clear memory")
 
     def assign_permanent_slot(self, slot, options):
         if self.exec_js(f"return !Game.UpgradesById[264+{slot}].bought;"):
@@ -237,6 +342,7 @@ class CookieClicker:
             self.reload_cookieclicker()
 
     def reload_cookieclicker(self, skip_save=False):
+        self.interval_id = None
         if not skip_save:
             self.save_game(path=self.save_file)
         self.driver.quit()
@@ -284,6 +390,10 @@ class CookieClicker:
         if self.plants is None:
             self.get_plant_details(ignore_tick=True)
 
+        self.get_active_buffs()
+        if self.is_upgrade_unlocked("A crumbly egg"):
+            self.dragon_auras_lookup = self.exec_js(script="return Game.dragonAurasBN;", default_return={})
+
     def load_mods(self):
         mods_to_load = {
             "FortuneCookie": "https://klattmose.github.io/CookieClicker/FortuneCookie.js",
@@ -314,6 +424,15 @@ class CookieClicker:
                 self.load_mods()
             except JavascriptException:
                 self.reload_cookieclicker()
+
+        try:
+            if self.interval_id:
+                self.driver.execute_script(f"javascript:clearInterval({self.interval_id});")
+                self.interval_id = None
+                self.autoclicker(amount_of_clicks=AC_CLICKS, ms_interval=AC_MS)
+        except JavascriptException:
+            print(f"{timestamp()}: Failed to clear autoclicker.")
+
 
     def accept_cookie_notification(self):
         try:
@@ -460,7 +579,6 @@ class CookieClicker:
 
         # Fetch next soil time if it hasn't been set
         if self.next_soil_time == 0:
-            self.set_cps_multiplier()
             self.next_soil_time = float(self.exec_js(script=f"return {self.farm_minigame}.nextSoil / 1000;",
                                                      default_return=current_time + 1000))
 
@@ -484,56 +602,64 @@ class CookieClicker:
         print(f'{timestamp()}: Updating plant details in self.plants and self.plants_by_id. '
               f'Next garden tick in {seconds_until_next_tick:.0f} seconds at {time_of_next_tick}.')
 
-        current_soil_id_js = f"{self.farm_minigame}.soil"
-        (self.plants,
-         self.plants_by_id,
-         self.max_plants,
-         self.current_soil_id) = self.exec_js(script=f"return [{self.farm_minigame}.plants, "
-                                                     f"{self.farm_minigame}.plantsById, "
-                                                     f"{self.farm_minigame}.plantsN, {current_soil_id_js}];",
-                                              default_return=[None, None, None, None])
+        # current_soil_id_js = f"{self.farm_minigame}.soil"
+        garden_data = self.exec_js(script=f"""
+                                return {{
+                                    plants: {self.farm_minigame}.plants,
+                                    plantsById: {self.farm_minigame}.plantsById,
+                                    plantsN: {self.farm_minigame}.plantsN,
+                                    currentSoilId: {self.farm_minigame}.soil,
+                                    auraMult: Game.auraMult('Supreme Intellect'),
+                                    plot: {self.farm_minigame}.plot,
+                                    plotBoost: {self.farm_minigame}.plotBoost
+                                    }}
+                                """)
 
-        if any(var is None for var in (self.plants, self.plants_by_id, self.max_plants, self.current_soil_id)):
+        if garden_data:
+            self.plants = garden_data['plants']
+            self.plants_by_id = garden_data['plantsById']
+            self.max_plants = garden_data['plantsN']
+            self.current_soil_id = garden_data['currentSoilId']
+            aura_multi = garden_data['auraMult']
+            dragon_boost = 1 / (1 + 0.05 * aura_multi)
+            self.plot = garden_data['plot']
+            self.plot_boost = garden_data['plotBoost']
+        else:
             self.click_cookie()
             return
 
         try:
             # Reset plant states
             for key in self.plants:
-                self.click_cookie()
                 self.plants[key]['growing'] = False
                 self.plants[key]["ticks_until_mature"] = float('inf')
                 self.plants[key]["ticks_until_decayed"] = float('inf')
 
             self.set_farm_size()
             self.occupied_tiles = {}
-            self.get_plot_details()
-
-            aura_multi = self.exec_js(script="return Game.auraMult('Supreme Intellect');", default_return=0)
-            dragon_boost = 1 / (1 + 0.05 * aura_multi)
 
             for tile in self.farm_size:
-                self.click_cookie()
-                tile_id = self.get_plant_id_of_tile(tile["x"], tile["y"])
+                x, y = tile['x'], tile['y']
+                tile_id = self.get_plant_id_of_tile(x, y)
                 if tile_id in [self.empty_tile_plant_id, self.invalid_plant_id]:
                     continue
 
                 plant = self.plants_by_id[tile_id]['key']
-                age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
-                plot_boost_value = self.plot_boost[tile["y"]][tile["x"]][0] * dragon_boost
+                age = self.get_plant_maturity_of_tile(x=x, y=y)
+                plot_boost_value = self.plot_boost[y][x][0] * dragon_boost
                 max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant]["ageTickR"]) * plot_boost_value
                 avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
                     "ageTickR"] / 2) * plot_boost_value
                 age_at_next_tick = age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick
 
-                ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
-                ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
+                ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=x, y=y)
+                ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=x, y=y)
 
                 if not self.plants[plant]["unlocked"]:
                     if (plant != 'meddleweed' and age >= self.plants[plant]["mature"]) or (
                             plant == 'meddleweed' and age_at_next_tick >= 100):
                         print(f'{timestamp()}: Harvesting tile {tile} to unlock seed. {plant} is mature.')
-                        self.exec_js(script=f"{self.farm_minigame}.harvest({tile['x']},{tile['y']});")
+                        self.exec_js(script=f"{self.farm_minigame}.harvest({x},{y});")
 
                         self.get_plot_details()
                         self.plants[plant]["unlocked"] = True
@@ -541,25 +667,25 @@ class CookieClicker:
                         self.plants[plant]["growing"] = False
                         self.save_game(path=f'./{plant}_unlocked.txt')
                         if plant == 'meddleweed':
-                            tile_id = self.get_plant_id_of_tile(tile["x"], tile["y"])
+                            tile_id = self.get_plant_id_of_tile(x, y)
                             if tile_id in [self.empty_tile_plant_id, self.invalid_plant_id]:
                                 continue
                             plant = self.plants_by_id[tile_id]['key']
-                            age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
+                            age = self.get_plant_maturity_of_tile(x=x, y=y)
                             max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
                                 "ageTickR"]) * plot_boost_value
                             avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
                                 "ageTickR"] / 2) * plot_boost_value
                             age_at_next_tick = (
                                 age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick)
-                            ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
-                            ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
+                            ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=x, y=y)
+                            ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=x, y=y)
                             self.plants[plant]["ticks_until_mature"] = min(self.plants[plant]["ticks_until_mature"],
                                                                            ticks_until_mature)
                             self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
                                                                             ticks_until_decayed)
                             self.plants[plant]["growing"] = True
-                            self.occupied_tiles[tile["x"], tile["y"]] = {
+                            self.occupied_tiles[x, y] = {
                                 "name": plant,
                                 "id": tile_id,
                                 "ticks_until_mature": ticks_until_mature,
@@ -573,7 +699,7 @@ class CookieClicker:
                         self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
                                                                         ticks_until_decayed)
                         self.plants[plant]["growing"] = True
-                        self.occupied_tiles[tile["x"], tile["y"]] = {
+                        self.occupied_tiles[x, y] = {
                             "name": plant,
                             "id": tile_id,
                             "ticks_until_mature": ticks_until_mature,
@@ -583,31 +709,31 @@ class CookieClicker:
                         }
                 elif age_at_next_tick >= 100:
                     print(f'{timestamp()}: Harvesting {plant} at tile {tile} before decay.')
-                    self.exec_js(script=f"{self.farm_minigame}.harvest({tile['x']},{tile['y']});")
+                    self.exec_js(script=f"{self.farm_minigame}.harvest({x},{y});")
 
                     self.get_plot_details()
                     if self.cpsMult > 1:
                         self.last_buffed_harvest = current_time
                     if plant == 'meddleweed':
-                        tile_id = self.get_plant_id_of_tile(tile["x"], tile["y"])
+                        tile_id = self.get_plant_id_of_tile(x, y)
                         if tile_id in [self.empty_tile_plant_id, self.invalid_plant_id]:
                             continue
                         plant = self.plants_by_id[tile_id]['key']
-                        age = self.get_plant_maturity_of_tile(x=tile["x"], y=tile["y"])
+                        age = self.get_plant_maturity_of_tile(x=x, y=y)
                         max_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
                             "ageTickR"]) * plot_boost_value
                         avg_age_per_tick = (self.plants[plant]["ageTick"] + self.plants[plant][
                             "ageTickR"] / 2) * plot_boost_value
                         age_at_next_tick = (
                             age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick)
-                        ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=tile['x'], y=tile['y'])
-                        ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=tile['x'], y=tile['y'])
+                        ticks_until_mature = self.plant_ticks_until_mature(plant=plant, x=x, y=y)
+                        ticks_until_decayed = self.plant_ticks_until_decayed(plant=plant, x=x, y=y)
                         self.plants[plant]["ticks_until_mature"] = min(self.plants[plant]["ticks_until_mature"],
                                                                        ticks_until_mature)
                         self.plants[plant]["ticks_until_decayed"] = min(self.plants[plant]["ticks_until_decayed"],
                                                                         ticks_until_decayed)
                         self.plants[plant]["growing"] = True
-                        self.occupied_tiles[tile["x"], tile["y"]] = {
+                        self.occupied_tiles[x, y] = {
                             "name": plant,
                             "id": tile_id,
                             "ticks_until_mature": ticks_until_mature,
@@ -623,7 +749,7 @@ class CookieClicker:
                     age_at_next_tick = (
                         age + max_age_per_tick if age + max_age_per_tick >= 100 else age + avg_age_per_tick)
 
-                    self.occupied_tiles[tile["x"], tile["y"]] = {
+                    self.occupied_tiles[x, y] = {
                         "name": plant,
                         "id": tile_id,
                         "ticks_until_mature": ticks_until_mature,
@@ -653,7 +779,6 @@ class CookieClicker:
         self.num_locked_plants_growing = len(locked_plants_growing)
 
         for key in locked_plants_growing:
-            self.click_cookie()
             self.save_game(path=f'./{key}.txt')
 
         print(f"{timestamp()}: {self.num_plants_unlocked} plants are unlocked and "
@@ -1253,6 +1378,9 @@ class CookieClicker:
 
                     seed_processed = True
                 elif seed == "queenbeetLump":
+                    if self.farm_level < 3:
+                        print(f"{timestamp()}: Farm level is not high enough to try for JQB.")
+                        continue
                     if not self.plants["queenbeet"]["unlocked"]:
                         parent_seeds_to_unlock.append('queenbeet')
                         print(f"{timestamp()}: {Fore.BLUE}queenbeetLumps parent is not unlocked. "
@@ -1274,6 +1402,12 @@ class CookieClicker:
                     self.clean_garden(tiles=self.occupied_tiles)
                     seed_processed = True
                 elif seed == "everdaisy":
+                    if self.farm_level < 3:
+                        print(f"{timestamp()}: Farm level is not high enough to try for Everdaisy.")
+                        continue
+                    elif self.farm_level < 9 and self.plants["queenbeetLump"]["growing"]: # Change to 7 after fixing script
+                        print(f"{timestamp()}: Unable to get Everdaisy while JQB growing with farm level < 7.")
+                        continue
                     parents = ['elderwort', 'tidygrass']
                     if not (self.plants["elderwort"]["unlocked"] and self.plants["tidygrass"]["unlocked"]):
                         locked_parents = ' & '.join([parent for parent in parents
@@ -1340,7 +1474,9 @@ class CookieClicker:
             if self.cpsMult > 1:
                 self.last_buffed_harvest = time.time()
 
+            previous_lumps = self.exec_js(script='return Game.lumps;', default_return=0)
             self.exec_js(script=f"{self.farm_minigame}.askConvert();Game.ConfirmPrompt();")
+            self.check_and_level_up(previous_lumps)
             for plant in self.plants:
                 try:
                     remove(f"./{plant}.txt")
@@ -1784,76 +1920,104 @@ class CookieClicker:
 
     def get_active_buffs(self):
         script = """
-                    return [
-                        'Frenzy' in Game.buffs,
-                        'High-five' in Game.buffs ||
-                               'Congregation' in Game.buffs ||
-                               'Luxuriant harvest' in Game.buffs ||
-                               'Ore vein' in Game.buffs ||
-                               'Oiled-up' in Game.buffs ||
-                               'Juicy profits' in Game.buffs ||
-                               'Fervent adoration' in Game.buffs ||
-                               'Manabloom' in Game.buffs ||
-                               'Delicious lifeforms' in Game.buffs ||
-                               'Breakthrough' in Game.buffs ||
-                               'Righteous cataclysm' in Game.buffs ||
-                               'Golden ages' in Game.buffs ||
-                               'Extra cycles' in Game.buffs ||
-                               'Solar flare' in Game.buffs ||
-                               'Winning streak' in Game.buffs ||
-                               'Macrocosm' in Game.buffs ||
-                               'Refactoring' in Game.buffs ||
-                               'Cosmic nursery' in Game.buffs ||
-                               'Brainstorm' in Game.buffs ||
-                               'Deduplication' in Game.buffs,
-                        'Dragon Harvest' in Game.buffs,
-                        'Dragonflight' in Game.buffs,
-                        'Click frenzy' in Game.buffs,
-                        'Elder frenzy' in Game.buffs,
-                        'Cursed finger' in Game.buffs,
-                        'Clot' in Game.buffs ||
-                                   'Slap to the face' in Game.buffs ||
-                                   'Senility' in Game.buffs ||
-                                   'Locusts' in Game.buffs ||
-                                   'Cave-in' in Game.buffs ||
-                                   'Jammed machinery' in Game.buffs ||
-                                   'Recession' in Game.buffs ||
-                                   'Crisis of faith' in Game.buffs ||
-                                   'Magivores' in Game.buffs ||
-                                   'Black holes' in Game.buffs ||
-                                   'Lab disaster' in Game.buffs ||
-                                   'Dimensional calamity' in Game.buffs ||
-                                   'Time jam' in Game.buffs ||
-                                   'Predictable tragedy' in Game.buffs ||
-                                   'Eclipse' in Game.buffs ||
-                                   'Dry spell' in Game.buffs ||
-                                   'Microcosm' in Game.buffs ||
-                                   'Antipattern' in Game.buffs ||
-                                   'Big crunch' in Game.buffs ||
-                                   'Brain freeze' in Game.buffs ||
-                                   'Clone strike' in Game.buffs
-                    ];
-                    """
-        (self.f_active, self.bs_active, self.dh_active, self.df_active,
-         self.cf_active, self.ef_active, self.cursed_finger_active,
-         self.debuff_active) = self.exec_js(script=script, default_return=[False] * 8)
+            const buffs = Object.values(Game.buffs);
+            const fps = Game.fps;
+            let minBuffTime = buffs.length ? Infinity : null;  // null if no buffs
+
+            const buildingSpecials = new Set([
+                'High-five', 'Congregation', 'Luxuriant harvest', 'Ore vein',
+                'Oiled-up', 'Juicy profits', 'Fervent adoration', 'Manabloom',
+                'Delicious lifeforms', 'Breakthrough', 'Righteous cataclysm',
+                'Golden ages', 'Extra cycles', 'Solar flare', 'Winning streak',
+                'Macrocosm', 'Refactoring', 'Cosmic nursery', 'Brainstorm',
+                'Deduplication'
+            ]);
+            const debuffs = new Set([
+                'Clot', 'Slap to the face', 'Senility', 'Locusts', 'Cave-in',
+                'Jammed machinery', 'Recession', 'Crisis of faith', 'Magivores',
+                'Black holes', 'Lab disaster', 'Dimensional calamity', 'Time jam',
+                'Predictable tragedy', 'Eclipse', 'Dry spell', 'Microcosm',
+                'Antipattern', 'Big crunch', 'Brain freeze', 'Clone strike'
+            ]);
+
+            // Single pass through buffs to collect all data
+            const result = {
+                counts: [0, 0, 0, 0, 0, 0, 0, 0],
+                activeDebuffs: [],
+                activeBuffs: []
+            };
+
+            for (const buff of buffs) {
+                const time = buff.time / fps;
+                const name = buff.name;
+
+                // Track minimum buff time (excluding permanent effects)
+                if (time < minBuffTime && time > 0) {
+                    minBuffTime = time;
+                }
+
+                // Count specific buffs
+                if (name === 'Frenzy') result.counts[0]++;
+                else if (buildingSpecials.has(name)) result.counts[1]++;
+                else if (name === 'Dragon Harvest') result.counts[2]++;
+                else if (name === 'Dragonflight') result.counts[3]++;
+                else if (name === 'Click frenzy') result.counts[4]++;
+                else if (name === 'Elder frenzy') result.counts[5]++;
+                else if (name === 'Cursed finger') result.counts[6]++;
+
+                // Track debuffs and regular buffs
+                if (debuffs.has(name)) {
+                    result.counts[7]++;
+                    result.activeDebuffs.push(`${name} (${time.toFixed(1)}s)`);
+                } else {
+                    result.activeBuffs.push(`${name} (${time.toFixed(1)}s)`);
+                }
+            }
+
+            result.minBuffTime = minBuffTime === Infinity ? null : minBuffTime;  // Convert Infinity to null
+            return result;
+        """
+
+        result = self.exec_js(script=script,
+                              default_return={'counts': [0] * 8,
+                                              'activeDebuffs': [],
+                                              'activeBuffs': [],
+                                              'minBuffTime': None})
+
+        (self.f_count, self.bs_count, self.dh_count, self.df_count,
+         self.cf_count, self.ef_count, self.cursed_finger_count,
+         self.debuff_count) = result['counts']
+
+        self.active_debuffs = result['activeDebuffs']
+        self.active_buffs = result['activeBuffs']
+
+        # Set boolean flags
+        self.f_active = self.f_count > 0
+        self.bs_active = self.bs_count > 0
+        self.dh_active = self.dh_count > 0
+        self.df_active = self.df_count > 0
+        self.cf_active = self.cf_count > 0
+        self.ef_active = self.ef_count > 0
+        self.cursed_finger_active = self.cursed_finger_count > 0
+        self.debuff_active = self.debuff_count > 0
+
+        # Schedule next CPS multiplier update
+        if result['minBuffTime'] is not None:
+            self.next_cps_update = time.time() + result['minBuffTime']
+
+        return sum([
+            self.f_count,
+            self.bs_count,
+            self.dh_count,
+            self.df_count,
+            self.cf_count,
+            self.ef_count
+        ])
 
     def cast_spell(self, spell_to_cast, exhaust_magic=False):
         """Cast spells optimally for maximum combo potential"""
-        grimoire = "Game.Objects['Wizard tower'].minigame"
 
-        # Define buff categories
-        CLICK_BUFFS = {'Click Frenzy', 'Dragonflight', 'Elder Frenzy'}
-        STACKING_BUFFS = {
-            'Click Frenzy', 'Dragonflight', 'Elder Frenzy', 'Building Special',
-            'Dragon Harvest', 'Frenzy',  # None stack with themselves
-            'High-five', 'Congregation', 'Luxuriant harvest', 'Ore vein',
-            'Oiled-up', 'Juicy profits', 'Fervent adoration', 'Manabloom',
-            'Delicious lifeforms', 'Breakthrough', 'Righteous cataclysm',
-            'Golden ages', 'Extra cycles', 'Solar flare', 'Winning streak',
-            'Macrocosm', 'Refactoring', 'Cosmic nursery', 'Brainstorm',
-            'Deduplication'
-        }
+        grimoire = "Game.Objects['Wizard tower'].minigame"
 
         try:
             # Get all relevant state including next spell forecasts with proper season index and backfire
@@ -1863,9 +2027,10 @@ class CookieClicker:
                     maxMagic: {grimoire}.magicM,
                     lumps: Game.lumps,
                     lumpRefill: Game.lumpRefill,
+                    hasGoldenCookie: Game.shimmers.some(s => s.type=="golden"),
                     buffs: Object.values(Game.buffs).map(b => ({{
                         name: b.name,
-                        time: b.time
+                        time: b.time / Game.fps  // Convert frames to seconds
                     }})),
                     spellCosts: {{
                         fthof: {grimoire}.getSpellCost({grimoire}.spellsById[1]),
@@ -1890,11 +2055,11 @@ class CookieClicker:
                 }}
             """)
 
-            if not state:
+            if not state or state['hasGoldenCookie']:
                 return
-
             # Handle specific spells first
             if spell_to_cast == "summon crafty pixies":
+                print(f"{timestamp()}: Summon Crafty Pixies costs {state['spellCosts']['scp']}. Have {state['magic']} magic.")
                 if state['magic'] >= state['spellCosts']['scp']:
                     scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
                                    '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
@@ -1951,465 +2116,347 @@ class CookieClicker:
                         return
                 return
 
-            # Parse GFD forecast - skip header line and get next two spell predictions
-            gfd_forecast = state['forecasts']['gfd']
-            gfd_lines = gfd_forecast.split('<br/>')
-            # Skip the "Forecast:" line and get next two actual predictions
-            gfd1_line = gfd_lines[1] if len(gfd_lines) > 1 else None
-            gfd2_line = gfd_lines[2] if len(gfd_lines) > 2 else None
+            elif spell_to_cast == "hand of fate":
+                def parse_buff_from_forecast(forecast_line):
+                    """Extract buff type from forecast line"""
+                    if not forecast_line:
+                        return None
 
-            def parse_buff_from_forecast(forecast_line):
-                """Extract buff type from forecast line"""
-                if not forecast_line:
+                    # Handle all bad spells
+                    if 'Blab' in forecast_line:  # Catches both red and green Blabs
+                        return 'Blab'
+                    if 'Clot' in forecast_line:
+                        return 'Clot'
+                    if 'Ruin' in forecast_line:
+                        return 'Ruin'
+
+                    # Special cases for beneficial red outcomes
+                    if 'Elder Frenzy' in forecast_line:
+                        return 'Elder frenzy'
+                    if 'Free Sugar Lump' in forecast_line:
+                        return 'Free Sugar Lump'
+
+                    # Skip other red outcomes that aren't FTHOF predictions
+                    if 'red' in forecast_line and 'Force the Hand of Fate' not in forecast_line:
+                        return None
+
+                    if 'Click Frenzy' in forecast_line:
+                        return 'Click frenzy'
+                    elif 'Building Special' in forecast_line:
+                        return 'Building Special'
+                    elif 'Dragon Harvest' in forecast_line:
+                        return 'Dragon Harvest'
+                    elif 'Dragonflight' in forecast_line:
+                        return 'Dragonflight'
+                    elif 'Frenzy' in forecast_line and 'Elder' not in forecast_line:
+                        return 'Frenzy'
+                    elif 'Lucky' in forecast_line:
+                        return 'Lucky'
+                    elif 'Cookie Storm' in forecast_line:
+                        return 'Cookie Storm'
                     return None
+                # Parse forecasts
+                fthof1_buff = parse_buff_from_forecast(state['forecasts']['fthof1'])
+                fthof2_buff = parse_buff_from_forecast(state['forecasts']['fthof2'])
 
-                # Special cases for beneficial red outcomes
-                if 'Elder Frenzy' in forecast_line:
-                    return 'Elder Frenzy'
-                if 'Free Sugar Lump' in forecast_line:
-                    return 'Free Sugar Lump'
+                gfd_forecast = state['forecasts']['gfd']
+                gfd_lines = gfd_forecast.split('<br/>')
+                gfd1_buff = parse_buff_from_forecast(gfd_lines[1] if len(gfd_lines) > 1 else None)
+                gfd2_buff = parse_buff_from_forecast(gfd_lines[2] if len(gfd_lines) > 2 else None)
 
-                # Skip other red outcomes that aren't FTHOF predictions
-                if 'red' in forecast_line and 'Force the Hand of Fate' not in forecast_line:
-                    return None
-
-                if 'Click Frenzy' in forecast_line:
-                    return 'Click Frenzy'
-                elif 'Building Special' in forecast_line:
-                    return 'Building Special'
-                elif 'Dragon Harvest' in forecast_line:
-                    return 'Dragon Harvest'
-                elif 'Dragonflight' in forecast_line:
-                    return 'Dragonflight'
-                elif 'Frenzy' in forecast_line and 'Elder' not in forecast_line:
-                    return 'Frenzy'
-                elif 'Lucky' in forecast_line:
-                    return 'Lucky'
-                elif 'Cookie Storm' in forecast_line:
-                    return 'Cookie Storm'
-                elif 'Blab' in forecast_line:
-                    return 'Skip'
-                return None
-
-            # Get current active buffs
-            active_buffs = {buff['name'] for buff in state['buffs']}
-            min_buff_time = min((buff['time'] for buff in state['buffs']), default=0)
-
-            # Parse all possible next buffs
-            fthof1_buff = parse_buff_from_forecast(state['forecasts']['fthof1'])
-            fthof2_buff = parse_buff_from_forecast(state['forecasts']['fthof2'])
-            gfd1_buff = parse_buff_from_forecast(gfd1_line)
-            gfd2_buff = parse_buff_from_forecast(gfd2_line)
-
-            def would_stack(new_buff, current_buffs):
-                """Check if new buff would add to current buffs"""
-                if new_buff == 'Skip' or new_buff == 'Lucky' or new_buff == 'Cookie Storm' or new_buff is None or new_buff == 'Free Sugar Lump':
-                    return False
-                # No buff stacks with itself
-                if new_buff in current_buffs:
-                    return False
-                # All other buffs can coexist
-                return new_buff in STACKING_BUFFS
-
-            def simulate_combo(buff1, buff2, current_buffs):
-                """Simulate adding two buffs to current buffs"""
-                result = current_buffs.copy()
-                if would_stack(buff1, result):
-                    result.add(buff1)
-                # Check stacking against updated buff list including buff1 if it was added
-                if would_stack(buff2, result):
-                    result.add(buff2)
-                return len(result), any(buff in CLICK_BUFFS for buff in result)
-
-            # Check all possible combinations - note that first spell affects which second spell we'll get
-            combos = [
-                ('fthof+fthof', *simulate_combo(fthof1_buff, fthof2_buff, active_buffs)),
-                ('gfd+gfd', *simulate_combo(gfd1_buff, gfd2_buff, active_buffs)),
-                ('fthof+gfd', *simulate_combo(fthof1_buff, gfd2_buff, active_buffs)),  # If we cast FTHOF first
-                ('gfd+fthof', *simulate_combo(gfd1_buff, fthof2_buff, active_buffs))  # If we cast GFD first
-            ]
-
-            # Handle bad outcomes first - if both immediate options are bad, use GFD and reload
-            if spell_to_cast == "hand of fate":
+                # Get costs and state
                 fthof_cost = state['spellCosts']['fthof']
                 gfd_cost = state['spellCosts']['gfd']
                 half_fthof = fthof_cost / 2
                 can_refill = state['lumps'] > 101 and not state['lumpRefill']
+                near_max_magic = state['magic'] >= (state['maxMagic'] - 1)
 
-                if (fthof1_buff is None and gfd1_buff is None and
-                        state['magic'] >= state['maxMagic'] - 1):
-                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
-                    self.save_game(path=self.save_file)
-                    print(f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid bad outcomes. "
-                          f"Magic was {state['magic']}.{Style.RESET_ALL}")
-                    time.sleep(1)
-                    self.load_save()
-                    return
+                # Get active buffs and check for building special and frenzy
+                active_buffs = [buff['name'] for buff in state['buffs']]
+                has_active_bs = any(buff['name'] in BUILDING_SPECIALS for buff in state['buffs'])
+                has_active_frenzy = 'Frenzy' in active_buffs
+                has_active_cb = any(buff['name'] in CLICK_BUFFS for buff in state['buffs'])
+                min_buff_time = min((buff['time'] for buff in state['buffs']), default=0)
 
-                # Find best combo that includes a click buff and results in 4+ buffs
+                # Check if any combo will give Building Special + Click Buff
+                def has_bs_and_cb(buff1, buff2):
+                    has_bs = any(b == 'Building Special' for b in (buff1, buff2))
+                    has_cb = any(cb in (buff1, buff2) for cb in CLICK_BUFFS)
+                    return has_bs and has_cb
+
+                # Helper function to format active buffs for printing
+                def format_active_buffs():
+                    if not state['buffs']:
+                        return "no active buffs"
+                    buff_list = [f"{buff['name']} ({buff['time']:.1f}s)" for buff in state['buffs']]
+                    return f"active buffs: {', '.join(buff_list)}"
+
+                # Order combos by magic cost (lowest to highest)
+                combo_buffs = [
+                    ('gfd+gfd', (gfd1_buff, gfd2_buff)),
+                    ('gfd+fthof', (gfd1_buff, fthof2_buff)),
+                    ('fthof+gfd', (fthof1_buff, gfd2_buff)),
+                    ('fthof+fthof', (fthof1_buff, fthof2_buff))
+                ]
+
+                # First check if any combo could give BS+CB or BS+BS
+                has_potential_combo = False
                 best_combo = None
-                for combo_name, buff_count, has_click in combos:
-                    if buff_count >= 4 and has_click and min_buff_time > 10:
+                best_combo_buffs = None
+                combo_type = None  # Track whether it's a BS+CB or BS+BS combo
+
+                 # Check combos in order of magic cost
+                for combo_name, (buff1, buff2) in combo_buffs:
+                    # Check for BS+CB combo
+                    if has_bs_and_cb(buff1, buff2):
+                        has_potential_combo = True
                         best_combo = combo_name
-                        break
+                        best_combo_buffs = (buff1, buff2)
+                        combo_type = "BS+CB"
+                        break  # Take first valid combo
 
-                if best_combo:
-                    # Calculate magic costs - GFD casting FTHOF adds half FTHOF cost
-                    magic_needed = {
-                        'fthof+fthof': fthof_cost * 2,
-                        'gfd+gfd': gfd_cost + half_fthof + gfd_cost + half_fthof,  # Both GFDs might cast FTHOF
-                        'fthof+gfd': fthof_cost + (gfd_cost + half_fthof),
-                        'gfd+fthof': (gfd_cost + half_fthof) + fthof_cost
-                    }
+                if not has_potential_combo:
+                    for combo_name, (buff1, buff2) in combo_buffs:
+                        # Check for BS+BS combo
+                        if buff1 == 'Building Special' and buff2 == 'Building Special':
+                            has_potential_combo = True
+                            best_combo = combo_name
+                            best_combo_buffs = (buff1, buff2)
+                            combo_type = "BS+BS"
+                            break  # Take first valid combo
 
-                                        # For refill to work:
-                    # 1. Must have enough lumps and no cooldown
-                    # 2. Current magic must be enough for first cast
-                    # 3. Refill after first cast must provide enough for second cast
-                    # Check if we have enough lumps and no refill cooldown
+                if has_potential_combo:
+                    # Adjust conditions based on combo type
+                    conditions_met = False
+                    if combo_type == "BS+CB":
+                        conditions_met = (
+                            has_active_frenzy and
+                            has_active_bs and
+                            min_buff_time > 13 and
+                            self.swaps_left == 3
+                        )
+                    elif combo_type == "BS+BS":
+                        conditions_met = (
+                            has_active_frenzy and
+                            has_active_cb and
+                            min_buff_time > 13 and
+                            self.swaps_left == 3
+                        )
 
-                    def click_golden_cookies():
-                        """Click any golden cookies on screen"""
-                        self.exec_js(script="""
-                            for (var sx in Game.shimmers) {
-                                var s = Game.shimmers[sx];
-                                if (s.type == "golden") {
-                                    s.pop();
-                                }
-                            };
-                        """)
+                    if conditions_met:
+                        # Calculate magic costs for combo
+                        first_cost = {
+                            'fthof+fthof': fthof_cost,
+                            'gfd+gfd': gfd_cost + half_fthof,
+                            'fthof+gfd': fthof_cost,
+                            'gfd+fthof': gfd_cost + half_fthof
+                        }[best_combo]
 
+                        second_cost = {
+                            'fthof+fthof': fthof_cost,
+                            'gfd+gfd': gfd_cost + half_fthof,
+                            'fthof+gfd': gfd_cost + half_fthof,
+                            'gfd+fthof': fthof_cost
+                        }[best_combo]
 
-                    if best_combo == 'fthof+fthof' and can_refill:
-                        # Check if we can cast first FTHOF and have enough after refill for second
-                        if state['magic'] >= fthof_cost:  # Can cast first FTHOF
-                            magic_after_cast = state['magic'] - fthof_cost
-                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
-                            can_cast_again = magic_after_cast + refill_amount >= fthof_cost  # Can cast second
+                        def click_golden_cookies():
+                            """Click any golden cookies on screen"""
+                            self.exec_js(script="""
+                                for (var sx in Game.shimmers) {
+                                    var s = Game.shimmers[sx];
+                                    if (s.type == "golden") {
+                                        s.pop();
+                                    }
+                                };
+                            """)
 
-                            if can_cast_again:
-                                print(f"{timestamp()}: Executing FTHOF+FTHOF combo")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
-                                click_golden_cookies()
-                                self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
-                                print(
-                                    f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
-                                click_golden_cookies()
+                        # Check if we can execute combo with refill
+                        if state['magic'] >= first_cost and can_refill:
+                            magic_after_first = state['magic'] - first_cost
+                            refill_amount = min(100, state['maxMagic'] - magic_after_first)
+                            magic_after_refill = magic_after_first + refill_amount
 
-                                self.pantheon()
+                            if magic_after_refill >= second_cost:
+                                print(f"{timestamp()}: {Fore.GREEN}Executing {best_combo} {combo_type} combo "
+                                      f"({best_combo_buffs[0]}+{best_combo_buffs[1]}) with {format_active_buffs()}{Style.RESET_ALL}")
 
-                    elif best_combo == 'gfd+gfd':
-                        # Check if we can cast first GFD and have enough after possible refill for second
-                        first_cost = gfd_cost + half_fthof
-                        second_cost = gfd_cost + half_fthof
-                        if state['magic'] >= first_cost:  # Can cast first GFD
-                            magic_after_cast = state['magic'] - first_cost
-                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
-                            can_cast_again = magic_after_cast + refill_amount >= second_cost
+                                def wait_for_new_buff(previous_buffs):
+                                    """Wait for a new buff to appear and become active"""
+                                    max_attempts = 50  # Prevent infinite loop
+                                    attempts = 0
+                                    while attempts < max_attempts:
+                                        self.exec_js(script='Game.ClickCookie();')
+                                        click_golden_cookies()
+                                        current_buffs = self.exec_js(script='return Object.values(Game.buffs).map(b => ({name: b.name, time: b.time / Game.fps}));')
+                                        if len(current_buffs) > len(previous_buffs):
+                                            # Format and print current buffs with times
+                                            buff_str = ', '.join(f"{buff['name']} ({buff['time']:.1f}s)" for buff in current_buffs)
+                                            print(f"{timestamp()}: Active buffs: {buff_str}")
+                                            return current_buffs
+                                        attempts += 1
+                                    return False  # Failed to get new buff
 
-                            if can_cast_again:
-                                print(f"{timestamp()}: Executing GFD+GFD combo")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
-                                click_golden_cookies()
-                                if magic_after_cast < second_cost:
+                                # First cast
+                                if best_combo.startswith('fthof'):
+                                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                                else:  # gfd
+                                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+
+                                # Wait for first buff to become active
+                                new_buffs = wait_for_new_buff(active_buffs)
+                                if not new_buffs:
+                                    print(f"{timestamp()}: {Fore.RED}Failed to get first buff active, aborting combo{Style.RESET_ALL}")
+                                    return
+
+                                # Refill if needed
+                                if magic_after_first < second_cost:
                                     self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
-                                    print(
-                                        f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
-                                click_golden_cookies()
+                                    print(f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
 
+                                # Second cast
+                                if best_combo.endswith('fthof'):
+                                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                                else:  # gfd
+                                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+
+                                # Wait for second buff to become active
+                                if not wait_for_new_buff(new_buffs):
+                                    print(f"{timestamp()}: {Fore.RED}Failed to get second buff active{Style.RESET_ALL}")
+
+                                # Switch pantheon
                                 self.pantheon()
-
-                    elif best_combo == 'fthof+gfd':
-                        # Check if we can cast FTHOF and have enough after refill for GFD
-                        if state['magic'] >= fthof_cost:  # Can cast FTHOF
-                            magic_after_cast = state['magic'] - fthof_cost
-                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
-                            can_cast_again = magic_after_cast + refill_amount >= (gfd_cost + half_fthof)
-
-                            if can_cast_again:
-                                print(f"{timestamp()}: Executing FTHOF+GFD combo")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
-                                click_golden_cookies()
-                                self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
-                                print(
-                                    f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
-                                click_golden_cookies()
-
-                                self.pantheon()
-
-                    else:  # gfd+fthof
-                        first_cost = gfd_cost + half_fthof
-                        if state['magic'] >= first_cost:  # Can cast GFD
-                            magic_after_cast = state['magic'] - first_cost
-                            refill_amount = min(100, state['maxMagic'] - magic_after_cast)
-                            can_cast_again = magic_after_cast + refill_amount >= fthof_cost
-
-                            if can_cast_again:
-                                print(f"{timestamp()}: Executing GFD+FTHOF combo")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
-                                click_golden_cookies()
-                                self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
-                                print(
-                                    f"{timestamp()}: Spending one lump to refill Grimoire (had {state['lumps']} lumps).")
-                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
-                                click_golden_cookies()
-
-                                self.pantheon()
-
-                    self.get_active_buffs()
+                    else:
+                        if near_max_magic:
+                            current_time = time.time()
+                            if current_time - self.last_spell_status_print >= 300:  # 300 seconds = 5 minutes
+                                if self.swaps_left != 3:
+                                    print(f"{timestamp()}: {Fore.YELLOW}Not enough swaps left ({self.swaps_left}) to execute {combo_type} combo. "
+                                      f"Next combo available: {best_combo} ({best_combo_buffs[0]}+{best_combo_buffs[1]}). "
+                                      f"Current {format_active_buffs()}{Style.RESET_ALL}")
+                                else:
+                                    print(f"{timestamp()}: {Fore.YELLOW}Holding spells for perfect {combo_type} combo conditions. "
+                                        f"Next combo available: {best_combo} ({best_combo_buffs[0]}+{best_combo_buffs[1]}). "
+                                        f"Current {format_active_buffs()}{Style.RESET_ALL}")
+                                self.last_spell_status_print = current_time
+                        return
 
                 else:
-                    # Check for single good outcomes when magic is near max
-                    near_max_magic = state['magic'] >= (state['maxMagic'] - 1)
+                    # Check for single click buff outcomes
+                    next_is_cb = (
+                        fthof1_buff in CLICK_BUFFS or
+                        gfd1_buff in CLICK_BUFFS
+                    )
 
-                    # Helper function to rank buff outcomes
-                    def get_buff_value(buff):
-                        if buff == 'Free Sugar Lump':
-                            return 4  # Highest priority
-                        if buff in CLICK_BUFFS:
-                            return 3  # Click buffs are very valuable
-                        if buff in STACKING_BUFFS:
-                            return 2  # Other stacking buffs
-                        if buff in ['Cookie Storm', 'Lucky']:
-                            return 1  # Lucky/Cookie Storm
-                        if buff == 'Skip':
-                            return 0  # Skip
-                        return -1    # None or backfire
+                    if next_is_cb:
+                        # Only cast if we already have a buff to stack with
+                        have_buff_to_stack = (
+                            has_active_frenzy or
+                            has_active_bs or
+                            any(cb in active_buffs for cb in CLICK_BUFFS)
+                        )
 
-                    # Get values for both spells
-                    fthof_value = get_buff_value(fthof1_buff)
-                    gfd_value = get_buff_value(gfd1_buff)
-
-                    if near_max_magic:
-                        # Cast spell if we have any good outcome
-                        if max(fthof_value, gfd_value) > 0:
-                            # If GFD result matches FTHOF, prefer GFD as it costs less
-                            if gfd_value >= fthof_value and state['magic'] >= (gfd_cost + half_fthof):
-                                print(f"{timestamp()}: Casting GFD for {gfd1_buff}")
+                        if have_buff_to_stack:
+                            # Prefer GFD if it gives click buff (costs less)
+                            if gfd1_buff in CLICK_BUFFS and state['magic'] >= (gfd_cost + half_fthof):
+                                print(f"{timestamp()}: {Fore.GREEN}Casting GFD for {gfd1_buff}. {format_active_buffs()}{Style.RESET_ALL}")
                                 self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
-                            elif fthof_value > 0 and state['magic'] >= fthof_cost:
-                                print(f"{timestamp()}: Casting FTHOF for {fthof1_buff}")
+                            elif fthof1_buff in CLICK_BUFFS and state['magic'] >= fthof_cost:
+                                print(f"{timestamp()}: {Fore.GREEN}Casting FTHOF for {fthof1_buff}. {format_active_buffs()}{Style.RESET_ALL}")
                                 self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+                        else:
+                            if near_max_magic:
+                                # Only print holding message once every 5 minutes
+                                current_time = time.time()
+                                if not hasattr(self, 'last_hold_print') or current_time - self.last_hold_print >= 300:
+                                    print(f"{timestamp()}: Holding click buff for potential stacking despite max magic")
+                                    self.last_hold_print = current_time
+                            return
+                    else:
+                        # Helper function to check for bad outcomes
+                        def is_bad_spell(forecast):
+                            if not forecast:
+                                return True
+                            return forecast in {'Blab', 'Clot', 'Ruin'}
 
-                            if fthof1_buff == 'Free Sugar Lump' or gfd1_buff == 'Free Sugar Lump':
-                                print(f"{timestamp()}: Got Free Sugar Lump!")
+                        # Helper function to rank buff outcomes
+                        def get_buff_value(buff):
+                            if buff == 'Free Sugar Lump':
+                                return 4  # Highest priority
+                            if buff in CLICK_BUFFS:
+                                return 3  # Click buffs are very valuable
+                            if buff in STACKING_BUFFS:
+                                return 2  # Other stacking buffs
+                            if buff in ['Cookie Storm', 'Lucky']:
+                                return 1  # Lucky/Cookie Storm
+                            return -1    # None or backfire
+
+                        # For all other outcomes, check for stacking opportunities or cast when near max magic
+                        def can_stack_buff(buff):
+                            """Check if a buff can stack (not already active and is stackable)"""
+                            if not buff or buff in {'Skip', 'Blab', 'Clot', 'Ruin'}:
+                                return False
+                            # No buff stacks with itself
+                            if buff in active_buffs:
+                                return False
+                            # Only certain buffs can stack
+                            return buff in STACKING_BUFFS
+
+                        # Get minimum active buff time
+                        active_buff_time = float('inf')
+                        for buff in state['buffs']:
+                            active_buff_time = min(active_buff_time, buff['time'])
+
+                        # Check if we have good stacking conditions
+                        can_stack = (
+                            90 > active_buff_time > 55 and  # Enough time on current buffs
+                            (can_stack_buff(fthof1_buff) or can_stack_buff(gfd1_buff)) and  # Have stackable buff
+                            len(state['buffs']) > 0  # Have at least one active buff
+                        )
+
+                        if can_stack or near_max_magic:
+                            # Check for bad outcomes in both spells
+                            fthof_is_bad = is_bad_spell(fthof1_buff)
+                            gfd_is_bad = is_bad_spell(gfd1_buff)
+
+                            if fthof_is_bad:
+                                print(f"{timestamp()}: {Fore.RED}Casting GFD for {gfd1_buff} to avoid FTHOF {fthof1_buff}. "
+                                    f"Magic was {state['magic']}.{Style.RESET_ALL}")
+                                self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                                if gfd_is_bad:
+                                    self.save_game(path=self.save_file)
+                                    time.sleep(1)
+                                    self.load_save()
+                                    # Run cleanup periodically
+                                    self.cleanup()
+
+                                return
+
+                            # Otherwise proceed with normal spell evaluation
+                            fthof_value = get_buff_value(fthof1_buff)
+                            gfd_value = get_buff_value(gfd1_buff)
+                            previous_lumps = self.exec_js(script='return Game.lumps;', default_return=0)
+
+                            # Cast spell if we have any good outcome
+                            if max(fthof_value, gfd_value) > 0:
+                                # cast_reason = "stacking opportunity" if can_stack else "near max magic"
+                                # If GFD result matches FTHOF, prefer GFD as it costs less
+                                if gfd_value >= fthof_value and state['magic'] >= (gfd_cost + half_fthof):
+                                    print(f"{timestamp()}: {Fore.GREEN}Casting GFD for {gfd1_buff}. {format_active_buffs()}{Style.RESET_ALL}")
+                                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[6])")
+                                elif fthof_value > 0 and state['magic'] >= fthof_cost:
+                                    print(f"{timestamp()}: {Fore.GREEN}Casting FTHOF for {fthof1_buff}. {format_active_buffs()}{Style.RESET_ALL }")
+                                    self.exec_js(script=f"{grimoire}.castSpell({grimoire}.spellsById[1])")
+
+                                if fthof1_buff == 'Free Sugar Lump' or gfd1_buff == 'Free Sugar Lump':
+                                    self.check_and_level_up(previous_lumps)
+                                    print(f"{timestamp()}: Got Free Sugar Lump!")
+
+            else:
+                print(f"{timestamp()}: Unknown spell: {spell_to_cast}")
+                return
 
         except JavascriptException:
             print(f"{timestamp()}: Failed to cast spell")
-
-    # def cast_spell(self, spell_to_cast, exhaust_magic=False):
-    #     game = 'Game.Objects["Wizard tower"].minigame'
-    #     spell = f'{game}.spells["{spell_to_cast}"]'
-    #     fthof = f'{game}.spells["hand of fate"]'
-    #     gfd = f'{game}.spellsById[6]'  # Gambler's Fever Dream
-    #     scp = f'{game}.spellsById[5]'  # Summon Crafty Pixies
-    #     gfd_forecasts = {
-    #         "green_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate',
-    #         "green_fthof_cf": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Click Frenzy)',
-    #         "green_fthof_bs": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Building Special)',
-    #         "green_fthof_frenzy": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                               '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Frenzy)',
-    #         "good_fthof_lucky": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                             '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Lucky)',
-    #         "good_fthof_blab": '<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                            '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Blab)',
-    #         "ef_fthof": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
-    #                     '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Force the Hand of Fate (Elder Frenzy)',
-    #         "red_fthof_lump": '<div width="100%"><b>Forecast:</b><br/><span class="red">'
-    #                           '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Free Sugar Lump'
-    #     }
-    #     buffer = 21
-    #
-    #     (magic,
-    #      magic_max,
-    #      spell_cost,
-    #      current_lumps,
-    #      lump_refill,
-    #      fthof_cost,
-    #      gfd_cost) = self.exec_js(script=f'return [{game}.magic, {game}.magicM, {game}.getSpellCost({spell}), '
-    #                                      f'Game.lumps, Game.lumpRefill, {game}.getSpellCost({fthof}), '
-    #                                      f'{game}.getSpellCost({gfd})];', default_return=[None] * 7)
-    #
-    #     if any(var is None for var in (magic, magic_max, spell_cost, current_lumps, fthof_cost, gfd_cost)):
-    #         return
-    #
-    #     fthof_half_cost = fthof_cost / 2
-    #     gfd_cast_fthof_cost = fthof_half_cost + gfd_cost
-    #
-    #     if spell_to_cast == "gambler's fever dream":
-    #         if magic < (spell_cost + fthof_half_cost) * 2:
-    #             self.click_golden_cookies = False
-    #             print(f'{timestamp()}: Waiting for enough magic to get Four-leaf cookie')
-    #             return
-    #
-    #         for _ in range(2):
-    #             self.click_cookie()
-    #             self.exec_js(script=f"{game}.castSpell({spell});")
-    #
-    #         self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click');")
-    #         print(f"{timestamp()}: Spending one lump to refill Grimoire.")
-    #         self.exec_js(script=f"{game}.castSpell({fthof});")
-    #         while not self.check_achievements('Four-leaf cookie'):
-    #             pass
-    #         self.click_golden_cookies = True
-    #
-    #         return
-    #
-    #     spells_cast = self.exec_js(script=f"return {game}.spellsCastTotal;")
-    #
-    #     if spells_cast == self.spell_count_four_leaf_cookie or spells_cast is None:
-    #         return
-    #
-    #     if magic >= gfd_cast_fthof_cost:
-    #         gfd_result = self.exec_js(script=f"return FortuneCookie.spellForecast({gfd});",
-    #                                   default_return="Failed to get Gambler's Fever Dream result")
-    #
-    #         if gfd_result == "Failed to get Gambler's Fever Dream result":
-    #             gfd_is_good_fthof = False
-    #         else:
-    #             gfd_is_good_fthof = (gfd_result.startswith(gfd_forecasts['green_fthof']) and
-    #                                  not gfd_result.startswith(gfd_forecasts["good_fthof_blab"])
-    #                                  ) or any(gfd_result.startswith(gfd_forecasts[key]) for key in
-    #                                           ["ef_fthof", "red_fthof_lump"]) if gfd_result else False
-    #     else:
-    #         gfd_result = 'Not enough magic for FTHOF'
-    #         gfd_is_good_fthof = False
-    #
-    #     if magic_max - magic >= 100 and not self.debuff_active and current_lumps > 101:
-    #         cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
-    #         click_buffs = self.cf_active + self.df_active
-    #         gfd_f = gfd_result.startswith(gfd_forecasts["green_fthof_frenzy"]) if gfd_result else False
-    #         gfd_bs = gfd_result.startswith(gfd_forecasts["green_fthof_bs"]) if gfd_result else False
-    #         gfd_ef = gfd_result.startswith(gfd_forecasts["ef_fthof"]) if gfd_result else False
-    #         gfd_cf = gfd_result.startswith(gfd_forecasts["green_fthof_cf"]) if gfd_result else False
-    #         gfd_cps_buff = gfd_f or gfd_bs or gfd_ef
-    #
-    #         next_cookie_js = (f"return FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' || "
-    #                           f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 * "
-    #                           f"FortuneCookie.getSimGCs(), false)")
-    #         next_cookie = self.exec_js(script=next_cookie_js, default_return="Failed to get next cookie result.")
-    #         fthof_frenzy = ">Frenzy<" in next_cookie
-    #         fthof_cf = ">Click Frenzy<" in next_cookie
-    #         fthof_bs = ">Building Special<" in next_cookie
-    #         fthof_ef = ">Elder Frenzy<" in next_cookie
-    #         fthof_cps_buff = fthof_frenzy or fthof_bs or fthof_ef
-    #
-    #         if (cps_buffs >= 2 and (self.swaps_left > 2 or current_lumps > 102) and
-    #             (gfd_cf or
-    #              (not gfd_is_good_fthof and
-    #               fthof_cf))) or (click_buffs and
-    #                               ((self.f_active and
-    #                                 (gfd_bs or gfd_ef or (not gfd_is_good_fthof and (fthof_bs or fthof_ef)))) or
-    #                                (self.ef_active and
-    #                                 (gfd_bs or gfd_f or (not gfd_is_good_fthof and (fthof_frenzy or fthof_bs)))) or
-    #                                (self.bs_active and
-    #                                 (gfd_cps_buff or (not gfd_is_good_fthof and fthof_cps_buff))))):
-    #             if lump_refill == 0:
-    #                 self.exec_js(script="FireEvent(l('grimoireLumpRefill'), 'click')")
-    #                 print(f"{timestamp()}: {Fore.RED}Spent a lump (had: {current_lumps}) on refilling 100 magic to "
-    #                       f"Grimoire. Magic was {magic}. {self.swaps_left} swaps left.{Style.RESET_ALL}")
-    #                 magic = self.exec_js(script=f"return {game}.magic", default_return=0)
-    #
-    #     buff = any([self.f_active, self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
-    #
-    #     cast = magic >= magic_max - 1 or (magic >= spell_cost and buff and
-    #                                       spell_to_cast == "hand of fate") or gfd_is_good_fthof
-    #
-    #     if spell_to_cast == 'summon crafty pixies':
-    #         print(f"{timestamp()}: Summon Crafty Pixies costs {spell_cost}. Have {magic} magic.")
-    #         if magic >= spell_cost:
-    #             scp_success = ('<div width="100%"><b>Forecast:</b><br/><span class="green">'
-    #                            '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Success</span><br/>')
-    #             scp_result = self.exec_js(script=f"return FortuneCookie.spellForecast({scp});", default_return="Failed")
-    #             # print(f"{timestamp()}: {scp_result}")
-    #             cast = scp_result.startswith(scp_success) if scp_result else False
-    #             if not cast:
-    #                 print(f"{timestamp()}: Spell will backfire; not casting.")
-    #         else:
-    #             cast = False
-    #
-    #     while cast:
-    #         if spell_to_cast == "hand of fate":
-    #             next_cookie_js = (f"return FortuneCookie.FateChecker({spells_cast}, ((Game.season == 'valentines' ||"
-    #                               f"Game.season == 'easter') ? 1 : 0), {game}.getFailChance({fthof}) + 0.15 *"
-    #                               f"FortuneCookie.getSimGCs(), false)")
-    #             next_cookie = self.exec_js(script=next_cookie_js, default_return="Failed")
-    #             if next_cookie:
-    #                 fthof_results = {
-    #                     "lucky": ">Lucky<" in next_cookie,
-    #                     "frenzy": ">Frenzy<" in next_cookie,
-    #                     "click_frenzy": ">Click Frenzy<" in next_cookie,
-    #                     "cookie_storm": "Cookie Storm" in next_cookie,
-    #                     "blab": ">Blab<" in next_cookie,
-    #                     "building_special": ">Building Special<" in next_cookie,
-    #                     "free_sugar_lump": ">Free Sugar Lump<" in next_cookie,
-    #                     "clot": ">Clot<" in next_cookie,
-    #                     "ruin": ">Ruin<" in next_cookie,
-    #                     "cursed_finger": ">Cursed Finger<" in next_cookie,
-    #                     "elder_frenzy": ">Elder Frenzy<" in next_cookie
-    #                 }
-    #             else:
-    #                 return
-    #             cps_buffs = self.bs_active + self.f_active + self.dh_active + self.ef_active
-    #             fthof_best = any([fthof_results[key] for key in ["frenzy", "click_frenzy", "cookie_storm",
-    #                                                              "building_special", "free_sugar_lump", "elder_frenzy",
-    #                                                              "cursed_finger"]])
-    #             no_frenzy_buff = any([self.bs_active, self.dh_active, self.cf_active, self.ef_active, self.df_active])
-    #
-    #             if any([fthof_results[key] for key in ["blab", "clot", "ruin"]]):
-    #                 if magic >= (gfd_cost + fthof_cost):
-    #                     bad_spell = next((spell for spell in ["Blab", "Clot", "Ruin"] if fthof_results[spell.lower()]),
-    #                                      "Unknown")
-    #
-    #                     self.exec_js(script=f"{game}.castSpell({gfd});")
-    #                     self.save_game(path=self.save_file)
-    #                     print(
-    #                         f"{timestamp()}: {Fore.RED}Casting Gambler's Fever Dream to avoid FTHOF {bad_spell}. "
-    #                         f"Magic was {magic}.{Style.RESET_ALL}")
-    #                     time.sleep(1)
-    #                     self.load_save()
-    #
-    #             elif magic >= magic_max - 1 or (self.debuff_active and fthof_results["cursed_finger"]) or \
-    #                     fthof_results["free_sugar_lump"] or (
-    #                     no_frenzy_buff and not self.debuff_active and any([fthof_results["frenzy"],
-    #                                                                        fthof_results["click_frenzy"],
-    #                                                                        fthof_results["cookie_storm"],
-    #                                                                        fthof_results["building_special"],
-    #                                                                        fthof_results["elder_frenzy"]])
-    #             ) or (cps_buffs >= 2 and not self.debuff_active and any( # Trying to use cps_buffs count instead of buff
-    #                 [fthof_results["click_frenzy"], fthof_results["cookie_storm"],
-    #                  fthof_results["building_special"], fthof_results["elder_frenzy"]])
-    #             ) or (fthof_results["lucky"] and cps_buffs >= 2):
-    #                 if gfd_is_good_fthof and gfd_forecasts["good_fthof_lucky"] and not fthof_best:
-    #                     print(f"{timestamp()}: {Fore.GREEN}Casting Gambler's Fever Dream. Magic was {magic}."
-    #                           f"{Style.RESET_ALL}")
-    #                     self.exec_js(script=f"{game}.castSpell({gfd})")
-    #                 elif magic >= fthof_cost:
-    #                     print(f"{timestamp()}: {Fore.GREEN}Casting Force the Hand of Fate. Magic was {magic}."
-    #                           f"{Style.RESET_ALL}")
-    #                     self.exec_js(script=f"{game}.castSpell({spell})")
-    #                 self.set_cps_multiplier()
-    #             cast = False
-    #         else:
-    #             if spell_to_cast == "resurrect abomination":
-    #                 self.pop_fattest_wrinkler()
-    #
-    #             self.exec_js(script=f"{game}.castSpell({spell})")
-    #             print(f"{timestamp()}: {Fore.GREEN}Casting {spell_to_cast}.{Style.RESET_ALL}")
-    #             if exhaust_magic:
-    #                 spell_cost = self.exec_js(script=f"return {game}.getSpellCost({spell});",
-    #                                           default_return=float('inf'))
-    #                 magic = self.exec_js(script=f"return {game}.magic;", default_return=0)
-    #                 cast = magic >= spell_cost + buffer
-    #             else:
-    #                 cast = False
-    #         self.click_golden_cookies = True
 
     def try_for_shriekbulbs(self):
         duketater = self.plants["duketater"]
@@ -2572,20 +2619,97 @@ class CookieClicker:
             tidygrass_tiles.append({"x": abs(3 - x_offset), "y": abs(5 - y_offset)})
             tidygrass_tiles.append({"x": abs(4 - x_offset), "y": abs(5 - y_offset)})
         else:
-            for e_x in range(6):
-                for e_y in [0, 3]:
+            if self.farm_level == 3:
+                for e_x in range(2, 5):
                     self.click_cookie()
-                    elderwort_tiles.append({"x": e_x, "y": e_y})
+                    elderwort_tiles.append({"x": e_x, "y": 4})
 
-            for t_x in [0, 2, 3, 5]:
-                for t_y in [1, 2, 4]:
+                for t_x in range(2, 5):
+                    for t_y in [2, 3]:
+                        self.click_cookie()
+                        if not (t_x == 3 and t_y == 3):
+                            tidygrass_tiles.append({"x": t_x, "y": t_y})
+            elif self.farm_level == 4:
+                for e_x in range(1, 5):
                     self.click_cookie()
-                    if t_y == 1 or (t_y == 2 and t_x != 3) or (t_y == 4 and t_x not in [3, 4]):
+                    elderwort_tiles.append({"x": e_x, "y": 4})
+
+                for t_x in range(1, 5):
+                    for t_y in [2, 3]:
+                        self.click_cookie()
+                        if not (t_x in [2, 3] and t_y == 3):
+                            tidygrass_tiles.append({"x": t_x, "y": t_y})
+            elif self.farm_level == 5:
+                for e_x in range(1, 5):
+                    for e_y in [1, 4]:
+                        self.click_cookie()
+                        if not (e_x == 1 and e_y == 4):
+                            elderwort_tiles.append({"x": e_x, "y": e_y})
+
+                for t_x in [1, 4]:
+                    for t_y in [2, 3]:
+                        self.click_cookie()
                         tidygrass_tiles.append({"x": t_x, "y": t_y})
 
-            for t_x in range(6):
-                self.click_cookie()
-                tidygrass_tiles.append({"x": t_x, "y": 5})
+                tidygrass_tiles.append({"x": 1, "y": 4})
+                tidygrass_tiles.append({"x": 2, "y": 3})
+            elif self.farm_level == 6:
+                for e_y in range(1, 5):
+                    self.click_cookie()
+                    elderwort_tiles.append({"x": 3, "y": e_y})
+
+                for t_x in [1, 5]:
+                    for t_y in range(1, 5):
+                        self.click_cookie()
+                        tidygrass_tiles.append({"x": t_x, "y": t_y})
+
+                for t_x in [2, 4]:
+                    for t_y in [1, 4]:
+                        self.click_cookie()
+                        tidygrass_tiles.append({"x": t_x, "y": t_y})
+            elif self.farm_level == 7:
+                for e_x in range(1, 6):
+                    self.click_cookie()
+                    elderwort_tiles.append({"x": 3, "y": 3})
+
+                for t_x in range(1, 6):
+                    for t_y in [1, 5]:
+                        self.click_cookie()
+                        tidygrass_tiles.append({"x": t_x, "y": t_y})
+
+                for t_x in [1, 5]:
+                    for t_y in [2, 4]:
+                        self.click_cookie()
+                        tidygrass_tiles.append({"x": t_x, "y": t_y})
+            elif self.farm_level == 8:
+                for e_x in range(0, 6):
+                    self.click_cookie()
+                    elderwort_tiles.append({"x": 3, "y": 3})
+
+                for t_x in range(0, 6):
+                    for t_y in [1, 5]:
+                        self.click_cookie()
+                        tidygrass_tiles.append({"x": t_x, "y": t_y})
+
+                for t_x in [0, 5]:
+                    for t_y in [2, 4]:
+                        self.click_cookie()
+                        tidygrass_tiles.append({"x": t_x, "y": t_y})
+            else:
+                for e_x in range(6):
+                    for e_y in [0, 3]:
+                        self.click_cookie()
+                        elderwort_tiles.append({"x": e_x, "y": e_y})
+
+                for t_x in [0, 2, 3, 5]:
+                    for t_y in [1, 2, 4]:
+                        self.click_cookie()
+                        if t_y == 1 or (t_y == 2 and t_x != 3) or (t_y == 4 and t_x not in [3, 4]):
+                            tidygrass_tiles.append({"x": t_x, "y": t_y})
+
+                for t_x in range(6):
+                    self.click_cookie()
+                    tidygrass_tiles.append({"x": t_x, "y": 5})
 
         elderwort_ticks_until_mature = self.plant_ticks_until_mature(plant='elderwort')
         tidygrass_ticks_until_mature = self.plant_ticks_until_mature(plant='tidygrass')
@@ -2606,24 +2730,64 @@ class CookieClicker:
     def try_for_juicy_queenbeet(self):
         queenbeet_id = self.plants["queenbeet"]["id"]
 
-        # This is written for a level nine and above farm only
-        quadrants = {
-            1: [],
-            2: [],
-            3: [],
-            4: []
-        }
+        if 3 <= self.farm_level <= 5:
+            quadrants = {
+                1: []
+            }
+        elif self.farm_level == 6:
+            quadrants = {
+                1: [],
+                2: []
+            }
+        else:
+            quadrants = {
+                1: [],
+                2: [],
+                3: [],
+                4: []
+            }
 
         for quadrant, q_coords in quadrants.items():
-            if quadrant in {1, 2}:
-                y_range = range(0, 3)
-            else:
-                y_range = range(3, 6)
+            if 3 <= self.farm_level <= 5:
+                x_range = range(2, 5)
+                y_range = range(2, 5)
+            elif self.farm_level == 6:
+                if quadrant == 1:
+                    x_range = range(3, 6)
+                else:
+                    x_range = range(1, 4)
 
-            if quadrant in {1, 4}:
-                x_range = range(3, 6)
+                y_range = range(1, 4)
+            elif self.farm_level == 7:
+                if quadrant in {1, 2}:
+                    y_range = range(1, 4)
+                else:
+                    y_range = range(3, 6)
+
+                if quadrant in {1, 4}:
+                    x_range = range(3, 6)
+                else:
+                    x_range = range(1, 4)
+            elif self.farm_level == 8:
+                if quadrant in {1, 2}:
+                    y_range = range(1, 4)
+                else:
+                    y_range = range(3, 6)
+
+                if quadrant in {1, 4}:
+                    x_range = range(3, 6)
+                else:
+                    x_range = range(0, 3)
             else:
-                x_range = range(0, 3)
+                if quadrant in {1, 2}:
+                    y_range = range(0, 3)
+                else:
+                    y_range = range(3, 6)
+
+                if quadrant in {1, 4}:
+                    x_range = range(3, 6)
+                else:
+                    x_range = range(0, 3)
 
             for x_coord in x_range:
                 for y_coord in y_range:
@@ -2631,10 +2795,30 @@ class CookieClicker:
                     q_coords.append({'x': x_coord, 'y': y_coord})
 
         def check_quadrant(coords):
-            grow_coords = [
-                (1, 1), (1, 4),
-                (4, 1), (4, 4)
-            ]
+            if 3 <= self.farm_level <= 5:
+                grow_coords = [
+                    (3, 3)
+                ]
+            elif self.farm_level == 6:
+                grow_coords = [
+                    (2, 2), (4, 2)
+                ]
+            elif self.farm_level == 7:
+                grow_coords = [
+                    (2, 2), (4, 2),
+                    (2, 4), (4, 4)
+                ]
+            elif self.farm_level == 8:
+                grow_coords = [
+                    (1, 2), (4, 2),
+                    (1, 4), (4, 4)
+                ]
+            else:
+                grow_coords = [
+                    (1, 1), (1, 4),
+                    (4, 1), (4, 4)
+                ]
+
 
             mutation_coords = [coord for coord in coords if (coord['x'], coord['y']) in grow_coords][0]
 
@@ -2842,18 +3026,38 @@ class CookieClicker:
             return
 
     def is_prestige_doubled(self):
-        prestige, new_pres = self.exec_js(script="return [Game.prestige, "
-                                                 "Game.HowMuchPrestige("
-                                                 "CookieMonsterData.Cache.RealCookiesEarned + "
-                                                 "Game.cookiesReset + "
-                                                 "CookieMonsterData.Cache.WrinklersTotal + "
-                                                 "(Game.HasUnlocked('Chocolate egg') && "
-                                                 "!Game.Has('Chocolate egg') ? "
-                                                 "CookieMonsterData.Cache.LastChoEgg : 0),)];",
-                                          default_return=[float('inf'), 0])
+        self.prestige, self.new_prestige = self.exec_js(script="return [Game.prestige, "
+                                                               "Game.HowMuchPrestige("
+                                                               "CookieMonsterData.Cache.RealCookiesEarned + "
+                                                               "Game.cookiesReset + "
+                                                               "CookieMonsterData.Cache.WrinklersTotal + "
+                                                               "(Game.HasUnlocked('Chocolate egg') && "
+                                                               "!Game.Has('Chocolate egg') ? "
+                                                               "CookieMonsterData.Cache.LastChoEgg : 0),)];",
+                                                        default_return=[float('inf'), 0])
 
-        doubled = prestige * 2 < new_pres
-        halfway = prestige * 1.5 < new_pres
+        doubled = self.prestige * 2 < self.new_prestige
+        halfway = self.prestige * 1.5 < self.new_prestige
+        previous_reset_bonus = self.reset_bonus_percent
+        if self.prestige == 0:
+            return
+        self.reset_bonus_percent = 1 - self.new_prestige/self.prestige
+
+        if self.print_prestige <= time.time():
+            print(f'{timestamp()}: Prestige after Godzamok click bonus: {self.new_prestige}. '
+                  f'Reset bonus: {self.reset_bonus_percent * 100:.2f}%. '
+                  f'Previous bonus: {previous_reset_bonus * 100:.2f}%')
+            self.print_prestige = float('inf')
+            self.godzamok_ascension_delay = False
+            try:
+                if self.interval_id:
+                    self.driver.execute_script(f"javascript:clearInterval({self.interval_id});")
+                    self.interval_id = None
+            except JavascriptException:
+                print(f"{timestamp()}: Failed to clear autoclicker.")
+
+            if not self.interval_id:
+                self.autoclicker(amount_of_clicks=AC_CLICKS, ms_interval=AC_MS)
 
         if halfway:
             self.sugar_frenzy_spend = True
@@ -2862,7 +3066,7 @@ class CookieClicker:
             print(f'{timestamp()}: {Fore.GREEN}TIME TO ASCEND - Move Skruuia to Diamond, pop all wrinklers, change '
                   f'auras to Earth Shatterer and Reality Bending, sell all stock market goods, sell all buildings, '
                   f'buy chocolate egg.{Style.RESET_ALL}')
-            if self.handle_ascension:
+            if self.handle_ascension and not self.godzamok_ascension_delay:
                 self.ascend()
 
     def ascend(self):
@@ -2927,6 +3131,13 @@ class CookieClicker:
                 input("Buy chocolate egg, then press Return to continue.")
 
             try:
+                if self.interval_id:
+                    self.driver.execute_script(f"javascript:clearInterval({self.interval_id});")
+                    self.interval_id = None
+            except JavascriptException:
+                print(f"{timestamp()}: Failed to clear autoclicker.")
+
+            try:
                 self.driver.execute_script("javascript:Game.Ascend(true);")
             except JavascriptException:
                 input("Failed to ascend. Ascend manually.")
@@ -2944,6 +3155,8 @@ class CookieClicker:
             time.sleep(5)
             self.get_ascension_mode()
             self.save_game(path=self.save_file)
+            if not self.interval_id:
+                self.autoclicker(amount_of_clicks=AC_CLICKS, ms_interval=AC_MS)
             return
 
         prestige_levels = int(self.exec_js(script="return Game.ascendMeterLevel;", default_return=0))
@@ -2988,21 +3201,16 @@ class CookieClicker:
                 return None
 
     def click_cookie(self):
-        def click_golden_cookie(click):
-            if click:
-                first_line_for_loop = "Game.ClickCookie(); var s = Game.shimmers[sx];"
-            else:
-                first_line_for_loop = "var s = Game.shimmers[sx];"
-
+        def click_golden_cookie():
             js_code = "for (var sx in Game.shimmers) {" \
-                      f"{first_line_for_loop}" \
+                      f"var s = Game.shimmers[sx];" \
                       "if (s.force == 'cookie storm drop') {s.pop();}" \
                       "else if (s.type != 'golden' || s.life < Game.fps || !Game.Achievements['Early bird'].won) " \
                       "{s.pop(); return;}" \
                       "else if ((s.life/Game.fps)<(s.dur-2) && (Game.Achievements['Fading luck'].won)) {" \
                       "s.pop(); return;}}"
 
-            if self.time_next_save - 55 < time.time():
+            if self.time_next_save - (SECONDS_BTWN_SAVES - 5) < time.time():
                 # Avoid multiple saves per second with every golden cookie
                 self.save_game(path=self.save_file)
 
@@ -3012,17 +3220,31 @@ class CookieClicker:
                 print(f"{timestamp()}: Failed to click golden cookie.")
 
         try:
+            # Check for page crashes
+            if self.driver.title == "Error":  # Check if the title indicates a crash
+                print(f"{timestamp()}: Page crashed, reloading without saving...")
+                self.reload_cookieclicker(skip_save=True)
+                return
+
             if (not self.is_veil_active or self.season_active) and (self.ascension_mode == 0 or self.true_neverclick):
+                # Initialize buff state when starting fresh
                 click = True
                 while click:
                     try:
-                        (shimmers,
-                         cookies,
-                         self.crafty_pixies) = self.driver.execute_script("javascript:Game.ClickCookie();"
-                                                                          "if (Game.TickerEffect) "
-                                                                          "{Game.tickerL.click()};"
-                                                                          "return [Game.shimmers, Game.cookies, "
-                                                                          "'Crafty pixies' in Game.buffs]")
+                        # Batch JavaScript execution into a single call
+                        result = self.driver.execute_script("""
+                            Game.ClickCookie();
+                            if (Game.TickerEffect) Game.tickerL.click();
+                            return {
+                                shimmers: Game.shimmers,
+                                cookies: Game.cookies,
+                                craftyPixies: 'Crafty pixies' in Game.buffs
+                            };
+                        """)
+
+                        shimmers = result['shimmers']
+                        cookies = result['cookies']
+                        self.crafty_pixies = result['craftyPixies']
                         self.cookie_click_errors = 0
                     except JavascriptException:
                         print(f"{timestamp()}: Error clicking cookie or checking shimmers.")
@@ -3031,39 +3253,92 @@ class CookieClicker:
                             self.reload_cookieclicker(skip_save=self.time_next_save - time.time() > 30)
                         continue
 
+                    # Handle golden cookies and update buff state only when needed
                     if shimmers and self.click_golden_cookies:
                         if self.attempt_1T_achievement:
                             if cookies <= 900000000000:
-                                click_golden_cookie(click=click)
+                                click_golden_cookie()
                             self.trillion_cookie_ascension()
                         else:
-                            click_golden_cookie(click=click)
+                            click_golden_cookie()
 
-                        self.get_active_buffs()
+                        active_buff_count = self.get_active_buffs()
+
+                        # Store previous buff counts if not initialized
+                        if not hasattr(self, 'previous_buff_counts'):
+                            self.previous_buff_counts = {
+                                'f': self.f_count,
+                                'bs': self.bs_count,
+                                'dh': self.dh_count,
+                                'df': self.df_count,
+                                'cf': self.cf_count,
+                                'ef': self.ef_count,
+                                'cursed': self.cursed_finger_count,
+                                'debuff': self.debuff_count
+                            }
+
+                        # Check if any buff counts changed
+                        buffs_changed = (
+                            self.f_count != self.previous_buff_counts['f'] or
+                            self.bs_count != self.previous_buff_counts['bs'] or
+                            self.dh_count != self.previous_buff_counts['dh'] or
+                            self.df_count != self.previous_buff_counts['df'] or
+                            self.cf_count != self.previous_buff_counts['cf'] or
+                            self.ef_count != self.previous_buff_counts['ef'] or
+                            self.cursed_finger_count != self.previous_buff_counts['cursed'] or
+                            self.debuff_count != self.previous_buff_counts['debuff']
+                        )
 
                         if self.debuff_active:
-                            print(f"{timestamp()}: {Fore.LIGHTRED_EX}Reloading to avoid debuff golden cookies."
+                            print(f"{timestamp()}: {Fore.LIGHTRED_EX}Reloading to avoid debuffs: {', '.join(self.active_debuffs)}"
                                   f"{Style.RESET_ALL}")
                             self.load_save()
+                            # Run cleanup periodically
+                            self.cleanup()
                             self.get_active_buffs()
-                        else:
+                            print(f"{timestamp()}: {Fore.LIGHTGREEN_EX}Active buffs after reload: {', '.join(self.active_buffs)}"
+                                  f"{Style.RESET_ALL}")
+                        elif buffs_changed:
+                            if self.cursed_finger_count > self.previous_buff_counts['cursed']:
+                                # Find Cursed Finger buff time from active_buffs
+                                for buff in self.active_buffs:
+                                    if buff.startswith('Cursed finger'):
+                                        # Extract time from "Cursed finger (123.4s)"
+                                        time_str = buff.split('(')[1].rstrip('s)')
+                                        buff_time = float(time_str)
+                                        self.delay_product_purchase_until_after = time.time() + buff_time
+                                        print(f"{timestamp()}: Delaying purchases for {buff_time:.1f}s due to Cursed Finger buff")
+                                        break
+                            self.next_cps_update = time.time()
                             self.set_cps_multiplier()
+                            if self.active_buffs:
+                                print(f"{timestamp()}: {Fore.LIGHTGREEN_EX}Active buffs: {', '.join(self.active_buffs)}"
+                                      f"{Style.RESET_ALL}")
+
+                                # Batch pantheon and spell checks together
+                                if not self.debuff_active and active_buff_count >= 2 and self.swaps_left == 3:
+                                    self.cast_spell(spell_to_cast="hand of fate", exhaust_magic=False)
+                                    self.pantheon()
+
+                            # Update previous buff counts
+                            self.previous_buff_counts.update({
+                                'f': self.f_count,
+                                'bs': self.bs_count,
+                                'dh': self.dh_count,
+                                'df': self.df_count,
+                                'cf': self.cf_count,
+                                'ef': self.ef_count,
+                                'cursed': self.cursed_finger_count,
+                                'debuff': self.debuff_count
+                            })
 
                     click = any([self.cf_active, self.df_active, self.cursed_finger_active])
 
+                    # Handle cursed finger upgrades
                     if self.cursed_finger_active and self.cursed_finger_upgrades_next_time <= time.time():
                         self.cursed_finger_upgrades_next_time = time.time() + 40
                         self.buy_upgrades()
 
-                    if (self.cf_active
-                        or self.df_active) and (self.bs_active + self.f_active +
-                                                self.ef_active + self.dh_active >= 2) and (self.swaps_left == 3 and
-                                                                                           self.cpsMult > CPS_THRESHOLD
-                                                                                          ):
-                        self.pantheon()
-
-                    if self.f_active + self.cf_active + self.bs_active + self.ef_active + self.dh_active + self.df_active >=2:
-                        self.cast_spell(spell_to_cast="hand of fate", exhaust_magic=False)
                     if self.crafty_pixies:
                         self.buy_products()
             elif not self.check_achievements('True Neverclick'):
@@ -3072,13 +3347,18 @@ class CookieClicker:
                 if shimmers and self.click_golden_cookies:
                     if self.attempt_1T_achievement:
                         if cookies <= 900000000000:
-                            click_golden_cookie(click=False)
+                            click_golden_cookie()
                         self.trillion_cookie_ascension()
                     else:
-                        click_golden_cookie(click=False)
+                        click_golden_cookie()
         except (Exception, WebDriverException) as e:
-            print(f"{timestamp()}: Unexpected error: {str(e)}. Reloading.")
-            self.reload_cookieclicker(skip_save=self.time_next_save - time.time() > 30)
+            # Handle specific exceptions related to session crashes
+            if "session deleted" in str(e) or "page crash" in str(e):
+                print(f"{timestamp()}: Detected page crash: {e}. Reloading without saving...")
+                self.reload_cookieclicker(skip_save=True)
+            else:
+                print(f"{timestamp()}: Unexpected error: {str(e)}. Reloading.")
+                self.reload_cookieclicker(skip_save=self.time_next_save - time.time() > 30)
 
     def save_game(self, path, click_cookie=True):
         if click_cookie:
@@ -3096,7 +3376,7 @@ class CookieClicker:
             progress.write(save_code)
 
         if path == self.save_file:
-            self.time_next_save = time.time() + 60
+            self.time_next_save = time.time() + SECONDS_BTWN_SAVES
 
         stack = traceback.extract_stack()
         filename, lineno, function_name, code = stack[-2]
@@ -3140,9 +3420,6 @@ class CookieClicker:
 
         blue_products = False
         if self.delay_product_purchase_until_after > time.time():
-            print(
-                f"{timestamp()}: {Fore.RED}Delaying product purchases until "
-                f"{time.ctime(self.delay_product_purchase_until_after)}{Style.RESET_ALL}.")
             return
 
         if self.attempt_endless_cycle and self.check_achievements('Endless cycle'):
@@ -3177,7 +3454,7 @@ class CookieClicker:
                         # TODO: See if I can remove this line of code
                         basic_cookie_click()
 
-                        amount = int(self.exec_js(script="return Game.ObjectsById[{product_id}].amount;",
+                        amount = int(self.exec_js(script=f"return Game.ObjectsById[{product_id}].amount;",
                                                   default_return=9000))
                         if amount == 9000:
                             return
@@ -3193,24 +3470,27 @@ class CookieClicker:
                 else:
                     if (not self.is_veil_active or self.season_active) and (self.ascension_mode == 0 or
                                                                             self.true_neverclick):
-                        third_line = 'Game.ClickCookie(); if (check_obj[b].pp < 1) {'
+                        third_line = 'Game.ClickCookie(); if (check_obj[b].pp < 3600) {'
                     else:
-                        third_line = 'if (check_obj[b].pp < 1) {'
+                        third_line = 'if (check_obj[b].pp < 3600) {'
 
+                    script = f"""
+                    javascript:
+                    function attemptPurchases(check_obj, amount) {{
+                        for (var b in check_obj) {{
+                            {third_line}
+                                Game.Objects[b].buy(amount);
+                            }}
+                        }}
+                    }}
+                    attemptPurchases(CookieMonsterData.Objects100, 100);
+                    attemptPurchases(CookieMonsterData.Objects10, 10);
+                    attemptPurchases(CookieMonsterData.Objects1, 1);
+                    """
                     try:
-                        self.driver.execute_script('javascript:check_obj = CookieMonsterData.Objects100;'
-                                                   'for (var b in check_obj){'
-                                                   f'{third_line}'
-                                                   'Game.Objects[b].buy(100)}};')
-                        self.driver.execute_script('javascript:check_obj = CookieMonsterData.Objects10;'
-                                                   'for (var b in check_obj){'
-                                                   f'{third_line}'
-                                                   'Game.Objects[b].buy(10)}};')
-                        self.driver.execute_script('javascript:check_obj = CookieMonsterData.Objects1;'
-                                                   'for (var b in check_obj){'
-                                                   f'{third_line}'
-                                                   'Game.Objects[b].buy(1)}};')
+                        self.driver.execute_script(script)
                     except JavascriptException:
+                        print(f"{timestamp()}: Failed to execute script: {script}")
                         print(f"{timestamp()}: Failed to buy based on pp.")
 
                     buildings_to_sell_dict = {building['name']: building for building in self.buildings_to_sell}
@@ -3226,7 +3506,7 @@ class CookieClicker:
                                 continue
 
                         cookies = self.exec_js(script="return Game.cookies", default_return=0)
-                        if building["price"] * 1.5 > cookies:
+                        if building["price"] > cookies:
                             basic_cookie_click()
                             continue
 
@@ -3353,10 +3633,6 @@ class CookieClicker:
         if self.attempt_1T_achievement:
             return
 
-        if self.cursed_finger_active:
-            print(f"{timestamp()}: {Fore.YELLOW}Skipping buy_products during cursed finger.{Style.RESET_ALL}")
-            self.delay_product_purchase_until_after = time.time() + 45
-
         upgrades_owned = self.exec_js(script="return Game.UpgradesOwned;", default_return=0)
 
         if upgrades_owned != 0 or self.check_achievements('Hardcore') or self.ascension_mode == 0:
@@ -3444,6 +3720,8 @@ class CookieClicker:
             new_lumps = int(self.exec_js(script="return Game.lumps;", default_return=float('inf')))
             if new_lump_goal > new_lumps:
                 self.load_save()
+            else:
+                self.check_and_level_up(current_lumps)
 
     def stock_market(self):
         market = 'Game.Objects["Bank"].minigame'
@@ -3857,7 +4135,11 @@ class CookieClicker:
                                         "Game.ToggleSpecialMenu(0);")
 
     def set_cps_multiplier(self):
-        self.cpsMult = self.exec_js(script="return Game.cookiesPs / Game.unbuffedCps;", default_return=1)
+        """Check if we need to update CPS multiplier based on buff expiration"""
+        if time.time() >= self.next_cps_update:
+            self.cpsMult = self.exec_js(script="return Game.cookiesPs / Game.unbuffedCps;", default_return=1)
+            self.get_active_buffs()  # Get new buff times and schedule next update
+
 
     def set_buildings_owned(self):
         self.buildings_owned = self.exec_js(script="return Game.BuildingsOwned;")
@@ -4176,14 +4458,20 @@ class CookieClicker:
                     return
         else:
             diamond_god = default_god1 = 'mokalsium'
-            self.set_cps_multiplier()
-            if not self.debuff_active and (self.cf_active or
-                                           self.df_active) and (self.bs_active +
-                                                                self.f_active +
-                                                                self.ef_active +
-                                                                self.dh_active >= 3) and (self.swaps_left == 3 and
-                                                                                          self.cpsMult > CPS_THRESHOLD):
-                diamond_god = 'godzamok'
+            active_buff_count = self.get_active_buffs()
+            # Check for click buff and total buff count
+            has_click_buff = self.cf_count + self.df_count + self.ef_count > 0
+
+            # Special case for Elder Frenzy
+            # has_ef_combo = self.ef_active and (
+            #     self.bs_active or self.f_active or
+            #     self.dh_active or self.cf_active or
+            #     self.df_active
+            # )
+
+            if not self.debuff_active and has_click_buff and self.swaps_left == 3:
+                if active_buff_count >= 4:
+                    diamond_god = 'godzamok'
 
             static_gods = [diamond_god, 'muridal', 'jeremy']
 
@@ -4218,11 +4506,6 @@ class CookieClicker:
                 slot_id += 1
 
     def godzamok_click_bonus(self):
-        def equation(t, m, l):
-            if t < 0:
-                return float('inf')
-            return np.floor(4 + np.power(t, 0.6) + 15 * np.log(1 + (t + 10 * (l - 1)) / 15)) - m
-
         (cookies, lumps, sugar_frenzy, self.cpsMult,
          buildings) = self.exec_js(script="return [Game.cookies, Game.lumps, Game.Upgrades['Sugar frenzy'].unlocked && "
                                           "!Game.Upgrades['Sugar frenzy'].bought, Game.cookiesPs / Game.unbuffedCps,"
@@ -4230,7 +4513,10 @@ class CookieClicker:
                                           "({id, name, amount, level, price, locked}))]",
                                    default_return=['Unknown', 100, False, 0, []])
 
-        print(f"{timestamp()}: Attempting Godzamok Click bonus. CPS Multiplier: {self.cpsMult}")
+        print(f"{timestamp()}: Attempting Godzamok Click bonus. CPS multi:{self.cpsMult}; "
+              f"Possible prestige after ascending: {self.new_prestige}")
+
+        self.godzamok_ascension_delay = True
 
         if self.sugar_frenzy_spend:
             if sugar_frenzy and lumps > 100:
@@ -4249,26 +4535,58 @@ class CookieClicker:
         print(f"{timestamp()}: {Fore.GREEN}Cookies in bank: {humanize.scientific(cookies, precision=5)}."
               f"{Style.RESET_ALL}")
 
+        self.print_prestige = time.time() + 10
+
         for building in self.buildings_to_sell:
             building_id = building['id']
-            self.exec_js(script="")
+            self.exec_js(script="") # Forces a cookie click
             if not buildings[building_id]["locked"]:
                 if building["name"] == 'Temple':
                     sell_quantity = buildings[building_id]['amount'] - 1
                 elif building["name"] == 'Wizard tower':
+                    try:
+                        if self.interval_id:
+                            self.driver.execute_script(f"javascript:clearInterval({self.interval_id});")
+                            self.interval_id = None
+                    except JavascriptException:
+                        print(f"{timestamp()}: Failed to clear autoclicker.")
+
+                    if not self.interval_id:
+                        self.autoclicker(amount_of_clicks=150, ms_interval=1)
+
                     m = self.exec_js(script="return Game.Objects['Wizard tower'].minigame.magic", default_return=0)
                     l = buildings[building_id]["level"]
                     min_magic = np.floor(4 + np.power(1, 0.6) + 15 * np.log(1 + (1 + 10 * (l - 1)) / 15))
                     if m >= min_magic:
-                        initial_guess = np.array([20], dtype=float)
-                        try:
-                            t_solution = fsolve(equation, initial_guess, args=(m, l), maxfev=1000)
-                            t_solution = max(int(np.ceil(t_solution[0])), 1)
-                        except RuntimeWarning:
-                            print(
-                                f"{timestamp()}: {Fore.RED}fsolve did not converge. Using fallback value for Wizard "
-                                f"tower.{Style.RESET_ALL}")
-                            t_solution = 20
+                        def magic_at_towers(t):
+                            return np.floor(4 + np.power(t, 0.6) + 15 * np.log(1 + (t + 10 * (l - 1)) / 15))
+
+                        # Set bounds for binary search
+                        left, right = 1, 1000  # Upper bound handles up to ~150 magic at level 10
+                        t_solution = 20  # default fallback
+
+                        # Check if magic requirement is achievable
+                        max_possible_magic = magic_at_towers(right)
+                        if m > max_possible_magic:
+                            print(f"{timestamp()}: {Fore.YELLOW}Warning: Required magic {m} exceeds maximum possible "
+                                  f"({max_possible_magic}) at level {l}{Style.RESET_ALL}")
+                            t_solution = right
+                        else:
+                            # Binary search for optimal tower count
+                            for _ in range(20):
+                                mid = (left + right) // 2
+                                magic_mid = magic_at_towers(mid)
+
+                                if magic_mid == m:
+                                    t_solution = mid
+                                    break
+                                elif magic_mid < m:
+                                    left = mid + 1
+                                else:
+                                    right = mid - 1
+                                    t_solution = mid  # keep last value that gives enough magic
+
+                        t_solution = max(int(t_solution), 1)
                     else:
                         # Magic is below minimum threshold for current level. Sell all but one Wizard tower
                         t_solution = 1
@@ -4293,11 +4611,11 @@ class CookieClicker:
 
         self.cast_spell(spell_to_cast='summon crafty pixies')
 
-        self.exec_js(script="Game.Objects['You'].buy(2)")
+        self.exec_js(script="Game.Objects['You'].buy(2);")
         print(f"{timestamp()}: {Fore.LIGHTGREEN_EX}Buying back 2 You.{Style.RESET_ALL}")
 
         for building in self.buildings_to_sell[::-1]:
-            self.exec_js(script="")
+            self.exec_js(script="") # Forces a cookie click
 
             building_id = building['id']
             if buildings[building_id]["locked"]:
@@ -4308,6 +4626,7 @@ class CookieClicker:
                 print(
                     f"{timestamp()}: {Fore.LIGHTGREEN_EX}Buying back {building['buy_back_quantity']} "
                     f"{building['name']}.{Style.RESET_ALL}")
+        self.exec_js(script="Game.Objects['You'].buy(2);")
 
     def open_mini_games(self):
         minigame_rows = [2, 5, 6, 7]
@@ -4359,6 +4678,19 @@ class CookieClicker:
             self.time_last_wrinkler_popped = time.time()
         except JavascriptException:
             self.click_cookie()
+
+    def check_and_level_up(self, previous_lumps):
+        """Check if lumps increased and level up if needed"""
+        current_lumps = self.exec_js(script='return Game.lumps;', default_return=0)
+        if current_lumps > previous_lumps:
+            # Keep leveling up while we have enough lumps
+            while True:
+                pre_level_lumps = self.exec_js(script='return Game.lumps;', default_return=0)
+                self.level_up()
+                post_level_lumps = self.exec_js(script='return Game.lumps;', default_return=0)
+                # Stop if no lumps were spent
+                if pre_level_lumps == post_level_lumps:
+                    break
 
     def level_up(self):
         buildings = {}
@@ -4465,7 +4797,7 @@ class CookieClicker:
                     reserve_lumps = next_level + 154
                     if lumps >= reserve_lumps:
                         self.exec_js(script=f"Game.Objects['{building}'].levelUp();")
-                    elif time.gmtime().tm_min % 5 == 0 and time.gmtime().tm_sec <= 2:
+                    else:
                         print(f"{timestamp()}: All level achievements unlocked. "
                               f"Saving until {reserve_lumps} lumps to upgrade {building} to level {next_level}.")
                 else:
