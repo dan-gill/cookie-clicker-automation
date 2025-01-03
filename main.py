@@ -16,7 +16,7 @@ HOURS_BETWEEN_WRINKLER_POPS = 24
 MIN_AVAILABLE_MEMORY_GB = 1.75 * 1024 * 1024 * 1024  # Pre-calculate bytes
 # HOURS_BETWEEN_RELOADS = 4  # This helps with the lag issue due to memory usage on Chrome
 
-building_level_goal = "cps"
+building_level_goal = "achievements" # cps or achievements
 handle_ascension = True
 
 cookie_clicker = CookieClicker(save_file=PROGRESS_FILE, building_level_goal=building_level_goal,
@@ -31,7 +31,7 @@ structured_end_time = time.localtime(end_time)
 print(f"Game will quit on {structured_end_time.tm_mon}/{structured_end_time.tm_mday} at {structured_end_time.tm_hour}:"
       f"{structured_end_time.tm_min:02}:{structured_end_time.tm_sec:02}.")
 # response = input("Do you want a manual run this round (Yes/No)? ")
-response = "No"
+response = "Yes"
 if response == "Yes":
     prompt_for_save = True
 else:
@@ -105,6 +105,9 @@ while is_game_on and not save_and_exit:
         # Buy upgrades and products
         cookie_clicker.buy_products()
         cookie_clicker.buy_upgrades()
+
+        if cookie_clicker.cheat:
+            cookie_clicker.cheating()
 
         cookie_clicker.stock_market()
 
